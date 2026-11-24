@@ -1,0 +1,812 @@
+/* Local study tree + native authenticated analysis bridge. Credentials never enter this page. */
+(function () {
+  'use strict';
+  const Chess = window.InstinctaZeroChessRules && window.InstinctaZeroChessRules.Chess;
+  if (!Chess || !window.LegacyChessground) throw new Error('Offline chess assets did not load');
+  const boardEl = document.getElementById('board');
+  const panel = document.getElementById('panel');
+  const title = document.getElementById('leela-eval');
+  const sfScore = document.getElementById('sf-eval');
+  const wrap = document.getElementById('board-wrap');
+  const arrows = document.getElementById('arrows');
+  wrap.classList.add('orientation-white');
+  const chess = new Chess();
+  const START_FEN = chess.fen();
+  const safe = value => String(value == null ? '' : value).replace(/[&<>'"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;' })[c]);
+  const native = () => window.InstinctaZeroNative || null;
+  const privacy = window.InstinctaZeroPrivacy;
+  const NODE_OPTIONS = [100, 200, 400, 700, 1000, 2000, 4000, 7000, 10000, 20000, 40000, 70000, 100000];
+  const BOOK_SPEEDS = ['bullet','blitz','rapid','classical','correspondence'];
+  const BOOK_RATINGS = [1600,1800,2000,2200,2500];
+  let settingsSection='Board';
+  const settings = { leelaLines:0, sfLines:2, sfDepth:16, smartInput: true, nodes: 1000, arrowCount: 8, arrowMode:'best', enabled: true, showArrows: true, backend:'cpu', bookSource:'lichess', bookSpeeds:[], bookRatings:[] };
+  let tab = 'engine', panelView = null, promotionPicker = null, nodeId = 0, restoring = false, activeNavigationStop = null, analysisActive = false, bookSettingsDirty = false, persistTimer = null, variationTarget = null;
+  let studyContext = { gameId:null, initialFen:START_FEN, title:'Local analysis', subtitle:'Starting position' };
+  const root = { id: 0, fen: START_FEN, san: null, move: null, number: 1, color: 'w', parent: null, children: [], selectedChild: null };
+  let cursor = root;
+  let legalCache = null, clickChoice = null, clickInput = null;
+  const inputEvidence = new window.InstinctaMoveInput.EngineCache(24);
+  let treeRevision = 0, renderedTreeRevision = -1, savedRevision = 0, replaceSavedTree = true, loadFailed = false;
+  const dirtyBranches = new Map(), nodeIndex = new Map([[0,root]]);
+  function changedBranch(parent) {
+    const previous=treeRevision++;
+    dirtyBranches.set(parent.id,parent); for(const child of parent.children)nodeIndex.set(child.id,child);
+    // The common edit extends a leaf. Append one control, preserving every existing
+    // variation element and its scroll position rather than rebuilding the whole tree.
+    if(renderedTreeRevision===previous && !panelView && tab==='moves' && parent.children.length===1) {
+      const button=panel.querySelector('[data-node="'+parent.id+'"]'), child=parent.children[0];
+      if(button && !panel.querySelector('[data-node="'+child.id+'"]')) {
+        button.insertAdjacentHTML('afterend',moveMarkup(child,false));bindMoveNode(button.nextElementSibling);renderedTreeRevision=treeRevision;
+      }
+    }
+  }
+  function saveNotice(message) {
+    let notice = document.getElementById('study-save-error');
+    if(!message){notice?.remove();return;}
+    if(!notice){notice=document.createElement('button');notice.id='study-save-error';notice.className='study-save-error';notice.setAttribute('role','alert');panel.before(notice);}
+    notice.textContent=message;notice.onclick=()=>{if(loadFailed)location.reload();else saveStudyNow();};
+  }
+  let repertoirePanel = null;
+  let positionEditor = null;
+  const editingPosition = () => !!positionEditor && positionEditor.isOpen();
+  let gameLoadId = 0, gameLoading = null;
+  const engine = { requestId: null, timer: null, watchdog:null, attempts:0, received:false, status: 'idle', lastGood: null, lines: [], stats: null, progress: null, error: '' };
+  const book = { requestId: null, loading: false, data: null, error: '' };
+  const fish = {local:'off', server:false, phoneLines:[], pcLines:[], pcError:'', error:'', download:'', lite:false, full:false};
+  const localFish = new LocalStockfish((fen, lines, error) => {
+    if (fen && fen !== chess.fen()) return;
+    fish.phoneLines = lines;
+    if(fen && lines?.length)rememberFishScore("Phone Stockfish",lines[0]);
+    fish.error = error;
+    queueAnalysisRender(true);
+  });
+  let displayedRoots = [];
+  let displayedFen = '';
+  function fishOptions() {
+    try { Object.assign(fish, JSON.parse(native()?.stockfishOptions?.() || '{}')); } catch (_) {}
+  }
+  function stopFishPosition() {
+    localFish.cancel();
+    fish.phoneLines = [];
+    fish.pcLines = [];
+    fish.pcError = '';
+    fish.error = '';
+    displayedRoots = [];
+  }
+  function startPhoneFish() {
+    if (fish.local !== 'off' && analysisActive && !document.hidden && !gameLoading && !editingPosition())
+      localFish.search(fish.local,chess.fen(),studyContext.initialFen,history(),settings.sfLines,settings.sfDepth);
+  }
+  function visibleRank(moves,to) {
+    if (displayedFen !== chess.fen()) return null;
+    const origins = displayedRoots.filter(u => u.slice(2,4)===to).map(u => u.slice(0,2));
+    if (!origins.length) return null;
+    const candidates = moves.filter(move => move.to === to).map(move => move.from);
+    return [...new Set([...origins.filter(from=>candidates.includes(from)), ...candidates])].map(from=>({from}));
+  }
+  const boardAssets = ['brown.svg','pieces/wK.svg','pieces/wQ.svg','pieces/wR.svg','pieces/wB.svg','pieces/wN.svg','pieces/wP.svg','pieces/bK.svg','pieces/bQ.svg','pieces/bR.svg','pieces/bB.svg','pieces/bN.svg','pieces/bP.svg'];
+  Promise.all(boardAssets.map(source => new Promise(resolve => { const image = new Image(); image.onload = image.onerror = resolve; image.src = source; }))).then(() => { document.documentElement.classList.remove('board-assets-loading'); refreshBoardBounds(); });
+
+  function color() { return chess.turn() === 'w' ? 'white' : 'black'; }
+  function history() { const result = []; for (let n = cursor; n && n.move; n = n.parent) result.push(n.move.from + n.move.to + (n.move.promotion || '')); return result.reverse(); }
+  function legalMoves() { const fen=chess.fen(); if(!legalCache || legalCache.fen!==fen)legalCache={fen,moves:chess.moves({verbose:true})};return legalCache.moves; }
+  function legalDests() { const result = {}; legalMoves().forEach(move => (result[move.from] || (result[move.from] = [])).push(move.to)); return result; }
+  function sync(lastMove) { ground.set({ fen: chess.fen(), turnColor: color(), dests: legalDests(), lastMove: lastMove || null }); }
+  function mainlineChild(node) { return node && node.children ? node.children[0] || null : null; }
+  function remember(move, number, mover) {
+    let child = cursor.children.find(item => item.san === move.san && item.fen === chess.fen());
+    if (!child) { child = { id: ++nodeId, fen: chess.fen(), san: move.san, move: { from: move.from, to: move.to, promotion: move.promotion || null }, number, color: mover, parent: cursor, children: [], selectedChild: null }; cursor.children.push(child); changedBranch(cursor); }
+    cursor.selectedChild = mainlineChild(cursor);
+    cursor = child; saveStudyNow(); return child;
+  }
+  function cancelBookRequest() { if (book.requestId && native() && native().cancelAnalysis) native().cancelAnalysis(book.requestId); book.requestId = null; book.loading = false; }
+  function stopEngineTransport() { if(engine.watchdog)clearTimeout(engine.watchdog);engine.watchdog=null;if(engine.timer)clearTimeout(engine.timer);engine.timer=null;if(engine.requestId && native())native().cancelAnalysis(engine.requestId);engine.requestId=null; }
+  function resetTransport() { stopFishPosition(); if (!analysisActive || document.hidden || gameLoading || editingPosition()) localFish.close(); stopEngineTransport(); cancelBookRequest(); if (engine.renderFrame != null) cancelAnimationFrame(engine.renderFrame); engine.renderFrame = null; engine.arrowsPending = false; }
+  function clearEngine(nextStatus) { if(engine.watchdog)clearTimeout(engine.watchdog);engine.watchdog=null; if (engine.timer) clearTimeout(engine.timer); engine.timer = null; if (engine.requestId && native()) native().cancelAnalysis(engine.requestId); engine.requestId = null; engine.status = nextStatus || 'idle'; engine.lastGood = null; engine.lines = []; engine.stats = null; engine.progress = null; engine.error = ''; renderArrows([]); }
+  function commitMove(from, to, promotion, keepClickChoice = false) { if (loadFailed || gameLoading || editingPosition()) return;
+    if(!keepClickChoice)clearClickChoice();
+    const number = chess.moveNumber(), mover = chess.turn(), uci = from + to + (promotion || '');
+    const projected = projectAnalysisToChild(engine.stats, uci, settings.nodes); let move;
+    try { move = chess.move({ from, to, promotion }); } catch (_) { move = null; }
+    if (!move) { sync(null); return; }
+    const child = remember(move, number, mover);
+    if (projected && (!child.analysisCache || child.analysisCache.inherited)) child.analysisCache = projected;
+    sync([from, to]); onPositionChanged();
+  }
+  function choosePromotion(from, to, options, apply = promotion => commitMove(from, to, promotion)) {
+    if (promotionPicker) return;
+    const names = { q:'Queen', r:'Rook', b:'Bishop', n:'Knight' }, choices = new Set(options.map(move => move.promotion));
+    const picker = document.createElement('div'); picker.className = 'promotion-picker'; picker.setAttribute('role','dialog'); picker.setAttribute('aria-modal','true'); picker.setAttribute('aria-label','Choose promotion piece');
+    picker.innerHTML = ['q','r','b','n'].filter(piece => choices.has(piece)).map(piece => '<button type="button" data-promotion="' + piece + '" aria-label="Promote to ' + names[piece] + '">' + piece.toUpperCase() + '</button>').join('') + '<button type="button" data-cancel aria-label="Cancel promotion">×</button>';
+    const close = revert => { picker.remove(); promotionPicker = null; if (revert) { clearClickChoice(); ground.cancelMove(); sync(null); } };
+    picker.querySelectorAll('[data-promotion]').forEach(button => button.onclick = () => { const promotion = button.dataset.promotion; close(false); apply(promotion); });
+    picker.querySelector('[data-cancel]').onclick = () => close(true); boardEl.appendChild(picker); promotionPicker = picker; picker.querySelector('[data-promotion]').focus();
+  }
+  function onMove(from, to) { clearClickChoice(); if (restoring || promotionPicker) { sync(null); return; } const options = legalMoves().filter(move => move.from === from && move.to === to); if (!options.length) { sync(null); return; } if (options.some(move => move.promotion)) choosePromotion(from, to, options); else commitMove(from, to); }
+  const ground = window.LegacyChessground(boardEl, { fen: chess.fen(), orientation:'white', turnColor:color(), coordinates:true, animation:{ enabled:true, duration:120 }, movable:{ color:'both', free:false, dests:legalDests(), showDests:true }, selectable:{ enabled:true }, draggable:{ enabled:true, magnified:false }, events:{ move:onMove } });
+
+  function clearClickChoice() { const previous=clickChoice;clickChoice=null;if(clickInput)clickInput.cancel();if(previous)heading(); }
+  function recentClickHistory() { const moves=[];for(let n=cursor;n && n.move && moves.length<2;n=n.parent)moves.push(n.move);return moves.reverse(); }
+  function destinationTap(to) {
+    // A candidate advances only when its piece has been dragged back. A tap in
+    // the resulting position is a fresh legal move (including a recapture).
+    const resumed=clickChoice && !clickChoice.current && clickChoice.parent===cursor && clickChoice.to===to;
+    if(!resumed) {
+      if(!legalMoves().some(move=>move.to===to))return;
+      clearClickChoice();
+      const moves=legalMoves(), ranking=visibleRank(moves,to) || (settings.enabled && inputEvidence.rank(chess.fen(),settings.backend,moves,to)) || window.InstinctaClickChess.ranker.rank(chess.fen(),moves,to,recentClickHistory());
+      if(!ranking.length)return;
+      clickChoice={parent:cursor,current:null,to,ranking,moves,index:0};
+    }
+    const choice=clickChoice, from=choice.ranking[choice.index].from;
+    const options=choice.moves.filter(move=>move.from===from && move.to===to);
+    // Origins are ranked, promotion pieces remain an explicit human choice.
+    const apply=promotion=>{
+      if(clickChoice!==choice || cursor!==choice.parent)return;
+      ground.cancelMove();commitMove(from,to,promotion,true);
+      if(cursor.parent!==choice.parent){clearClickChoice();return;}
+      choice.current=cursor;heading();
+    };
+    if(options.some(move=>move.promotion))choosePromotion(from,to,options,apply);else apply();
+  }
+  function clickCorrection() {
+    return clickChoice && clickChoice.current===cursor ? cursor.move : null;
+  }
+  function undoDestinationGuess(from, to) {
+    const choice=clickChoice, move=clickCorrection();
+    if(!move || from!==move.to || to!==move.from)return false;
+    const previous=cursor;
+    cursor=choice.parent;chess.load(cursor.fen);
+    // Restore the full parent FEN and study path, not a reverse piece move:
+    // captures, en passant, castling rights/rook, promotion and history survive.
+    // Only a leaf is disposable. An existing subtree stays exactly where it was.
+    if(previous.children.length===0) {
+      cursor.children=cursor.children.filter(child=>child!==previous);
+      nodeIndex.delete(previous.id);dirtyBranches.delete(previous.id);changedBranch(cursor);
+    }
+    cursor.selectedChild=mainlineChild(cursor);
+    choice.current=null;choice.index=(choice.index+1)%choice.ranking.length;
+    ground.cancelMove();sync(null);saveStudyNow();onPositionChanged();return true;
+  }
+  if(window.InstinctaClickChess)clickInput=window.InstinctaClickChess.bindDestinationInput({element:boardEl,ground,
+    enabled:()=>!loadFailed && !restoring && !gameLoading && !editingPosition() && !promotionPicker && ground.state.movable.dests!==null,
+    canTap:to=>settings.smartInput && legalMoves().some(move=>move.to===to),
+    tap:destinationTap,correction:()=>cursor.move || null,undo:(from,to)=>{
+      if (!cursor.parent || cursor.move?.to!==from || cursor.move.from!==to) return false;
+      if (clickCorrection()) return undoDestinationGuess(from,to);
+      restore(cursor.parent); return true;
+    },clear:clearClickChoice});
+
+  function refreshBoardBounds(runtime, element, redraw) {
+    runtime = runtime || ground;
+    element = element || boardEl;
+    requestAnimationFrame(() => {
+      runtime.setBounds(element.getBoundingClientRect());
+      runtime.redrawSync();
+      if (redraw) redraw(); else renderArrows(engine.lines);
+    });
+  }
+  function clampInteger(value, minimum, maximum, fallback) { const parsed = Number.parseInt(String(value == null ? '' : value), 10); return Number.isFinite(parsed) ? Math.max(minimum, Math.min(maximum, parsed)) : fallback; }
+  function orderedSelection(values, allowed) { const selected = new Set(Array.isArray(values) ? values.map(String) : []); return allowed.filter(value => selected.has(String(value))); }
+  function loadUiSettings() { fishOptions(); if (!native() || !native().getUiSettings) return; try { const saved = JSON.parse(native().getUiSettings() || '{}'); settings.leelaLines=clampInteger(saved.leelaLines,0,8,0);settings.sfLines=clampInteger(saved.sfLines,1,8,2);settings.sfDepth=clampInteger(saved.sfDepth,8,24,16); if(typeof saved.smartInput === 'boolean')settings.smartInput=saved.smartInput; settings.nodes = NODE_OPTIONS.includes(Number(saved.nodes)) ? Number(saved.nodes) : settings.nodes; settings.arrowCount = clampInteger(saved.arrowCount, 1, 8, settings.arrowCount); if (saved.arrowMode === 'best' || saved.arrowMode === 'maneuver') settings.arrowMode = saved.arrowMode; if (typeof saved.leelaEnabled === 'boolean') settings.enabled = saved.leelaEnabled; if (typeof saved.arrowsEnabled === 'boolean') settings.showArrows = saved.arrowsEnabled; if (saved.engineBackend === 'cpu' || saved.engineBackend === 'sycl') settings.backend = saved.engineBackend; if (saved.bookSource === 'masters' || saved.bookSource === 'lichess') settings.bookSource = saved.bookSource; settings.bookSpeeds = orderedSelection(saved.bookSpeeds, BOOK_SPEEDS); settings.bookRatings = orderedSelection(saved.bookRatings, BOOK_RATINGS); } catch (_) {} }
+  function saveUiSettings() { if (!native() || !native().saveUiSettings) return; native().saveUiSettings(JSON.stringify({ leelaLines:settings.leelaLines,sfLines:settings.sfLines,sfDepth:settings.sfDepth,smartInput:settings.smartInput, nodes: settings.nodes, arrowCount: settings.arrowCount, arrowMode:settings.arrowMode, leelaEnabled: settings.enabled, arrowsEnabled: settings.showArrows, engineBackend:settings.backend, appearance: 'brown', bookSource:settings.bookSource, bookSpeeds:settings.bookSpeeds, bookRatings:settings.bookRatings })); }
+  function studyRequest() { const request = { history: history(), nodes: settings.nodes, backend:settings.backend }; if(settings.leelaLines)request.leela_lines=settings.leelaLines; if (fish.server) Object.assign(request,{engines:settings.enabled?'both':'stockfish',sf_lines:settings.sfLines}); if (studyContext.gameId) request.game_id = studyContext.gameId; else if(studyContext.editedPosition)request.initial_fen = studyContext.initialFen; return request; }
+  function explorerRequest() { const request = { history: history(), source:settings.bookSource }; if (studyContext.gameId) request.game_id = studyContext.gameId; else if(studyContext.editedPosition)request.initial_fen = studyContext.initialFen; if (settings.bookSource === 'lichess') { if (settings.bookSpeeds.length) request.speeds = settings.bookSpeeds.slice(); if (settings.bookRatings.length) request.ratings = settings.bookRatings.slice(); } return request; }
+  function moveUci(node) { return node && node.move ? node.move.from + node.move.to + (node.move.promotion || '') : ''; }
+  function wireNode(node) { const result={u:moveUci(node),x:0,c:[]}, pending=[[node,result]];while(pending.length){const [parent,wire]=pending.pop();for(const child of parent.children){const next={u:moveUci(child),x:0,c:[]};wire.c.push(next);pending.push([child,next]);}}return result; }
+  function studyState() { return { v:1, gameId:studyContext.gameId, editedPosition:!!studyContext.editedPosition, initialFen:studyContext.initialFen, title:studyContext.title, subtitle:studyContext.subtitle, cursor:history(), tree:root.children.map(wireNode), selected:0, tab, black:wrap.classList.contains('orientation-black'), expanded:false }; }
+  function saveStudyNow() {
+    if (persistTimer) clearTimeout(persistTimer); persistTimer = null;
+    if(loadFailed || restoring)return false;
+    if(!native())return true;
+    try {
+      if(native().saveStudyDelta) {
+        const attached=n=>{for(let child=n;child.parent;child=child.parent)if(!child.parent.children.includes(child))return false;return true;};
+        let parents=[...dirtyBranches.values()].filter(attached);
+        if(replaceSavedTree){parents=[];const pending=[root];while(pending.length){const n=pending.pop();parents.push(n);pending.push(...n.children.slice().reverse());}}
+        const meta={v:2,gameId:studyContext.gameId,editedPosition:!!studyContext.editedPosition,initialFen:studyContext.initialFen,title:studyContext.title,subtitle:studyContext.subtitle,cursor:history(),tab,black:wrap.classList.contains('orientation-black'),expanded:false};
+        const result=JSON.parse(native().saveStudyDelta(JSON.stringify({revision:savedRevision,meta,replace:replaceSavedTree,branches:parents.map(n=>({parent:n.id,children:n.children.map(child=>({id:child.id,u:moveUci(child)}))}))})));
+        if(!result.saved)throw Error('save');
+        savedRevision=result.revision;replaceSavedTree=false;dirtyBranches.clear();
+      } else if(native().saveStudyState && native().saveStudyState(JSON.stringify(studyState()))===false)throw Error('save');
+      saveNotice('');return true;
+    } catch (_) {saveNotice('Board not saved · keep it open and tap to retry');return false;}
+  }
+  function scheduleStudySave() { if (restoring) return; if (persistTimer) clearTimeout(persistTimer); persistTimer = setTimeout(saveStudyNow, 120); }
+  function resetRoot(fen, context) { clearClickChoice(); root.fen = fen; root.children = []; root.selectedChild = null; delete root.analysisCache; delete root.folioScores; nodeId = 0; cursor = root; studyContext = context; chess.load(fen); treeRevision++;nodeIndex.clear();nodeIndex.set(0,root);dirtyBranches.clear();replaceSavedTree=true;savedRevision=native()?.getStudyRevision?.(!!context.editedPosition) || 0; }
+  function rebuildTree(rawChildren, parent) {
+    if(!Array.isArray(rawChildren))throw Error('Invalid saved tree');
+    const stack=rawChildren.slice().reverse().map(raw=>({raw,parent}));
+    while(stack.length) {
+      const {raw,parent}=stack.pop();
+      if(!raw || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(String(raw.u || '')))throw Error('Invalid saved move');
+      chess.load(parent.fen);const move=chess.move({from:raw.u.slice(0,2),to:raw.u.slice(2,4),promotion:raw.u[4]});
+      if(!move)throw Error('Invalid saved move');
+      const id=raw.id || ++nodeId;nodeId=Math.max(nodeId,id);
+      if(nodeIndex.has(id))throw Error('Duplicate saved move');
+      const child={id,fen:chess.fen(),san:move.san,move:{from:move.from,to:move.to,promotion:move.promotion || null},number:chess.moveNumber()-(chess.turn()==='w'?1:0),color:move.color,parent,children:[],selectedChild:null};
+      parent.children.push(child);parent.selectedChild=mainlineChild(parent);nodeIndex.set(id,child);
+      if(!Array.isArray(raw.c))throw Error('Invalid saved children');
+      for(let i=raw.c.length-1;i>=0;i--)stack.push({raw:raw.c[i],parent:child});
+    }
+  }
+  function decodedTree(raw) {
+    if(raw.v===1)return raw.tree;
+    if(raw.v!==2 || !Array.isArray(raw.nodes))throw Error('Unsupported saved board');
+    const nodes=new Map([[0,{c:[]}]]);
+    for(const n of raw.nodes){if(!Number.isSafeInteger(n.id)||n.id<=0||nodes.has(n.id))throw Error('Invalid saved move');nodes.set(n.id,{id:n.id,u:n.u,c:[]});}
+    for(const n of raw.nodes.slice().sort((a,b)=>a.o-b.o)){if(!nodes.has(n.p))throw Error('Missing saved parent');nodes.get(n.p).c.push(nodes.get(n.id));}
+    // A cycle or orphan is an error, never a reason to save a shortened board.
+    const seen=new Set(),stack=[nodes.get(0)];while(stack.length){const n=stack.pop();if(seen.has(n))throw Error('Cyclic saved board');seen.add(n);stack.push(...n.c);}
+    if(seen.size!==nodes.size)throw Error('Disconnected saved board');
+    return nodes.get(0).c;
+  }
+  function cursorForHistory(moves) { let node = root; for (const uci of Array.isArray(moves) ? moves : []) { const child = node.children.find(item => moveUci(item) === uci); if (!child) break; node = child; } return node; }
+  function applyStudyState(raw) { if (!raw || ![1,2].includes(raw.v) || typeof raw.initialFen !== 'string') return false; try { const tree=decodedTree(raw),probe = new Chess(raw.initialFen); const gameId = !raw.editedPosition && typeof raw.gameId === 'string' && /^[A-Za-z0-9]{8,16}$/.test(raw.gameId) ? raw.gameId : null; restoring = true; resetRoot(probe.fen({forceEnpassantSquare:true}), { gameId, editedPosition:raw.editedPosition === true, initialFen:probe.fen({forceEnpassantSquare:true}), title:String(raw.title || (gameId ? 'Completed game' : 'Local analysis')).slice(0,80), subtitle:String(raw.subtitle || 'Starting position').slice(0,120) }); rebuildTree(tree, root); root.selectedChild = mainlineChild(root); cursor = cursorForHistory(raw.cursor); if(history().length!==(raw.cursor || []).length)throw Error('Saved cursor missing');chess.load(cursor.fen); tab = ['info','moves','engine','chart','book','repertoire'].includes(raw.tab) ? raw.tab : 'engine'; wrap.classList.toggle('orientation-black', raw.black === true); wrap.classList.toggle('orientation-white', raw.black !== true); if ((raw.black === true) !== (ground.state.orientation === 'black')) ground.toggleOrientation(); wrap.classList.remove('expanded'); sync(null); restoring = false; savedRevision=raw.revision || 0;replaceSavedTree=raw.v!==2;dirtyBranches.clear();return true; } catch (_) { restoring = false; return false; } }
+  function loadStudyState() { if (!native() || !native().getStudyState) return false; try { const raw=JSON.parse(native().getStudyState() || '{}');if(!Object.keys(raw).length)return false;if(!applyStudyState(raw))throw Error('restore');return true; } catch (_) { loadFailed=true;saveNotice('Saved board could not be opened · untouched · tap to retry');return false; } }
+  function archivedTitle(game) { const white = game.white && (game.white.name || game.white.user || game.white.username) || 'White', black = game.black && (game.black.name || game.black.user || game.black.username) || 'Black'; return String(white + ' – ' + black).slice(0,80); }
+  function stopGameLoad() { ++gameLoadId; gameLoading = null; wrap.classList.remove('game-loading'); }
+  async function installArchivedGame(payload) {
+    privacy.refresh();
+    const game = payload && payload.game ? payload.game : payload;
+    if (!game || !/^[A-Za-z0-9]{8,16}$/.test(String(game.id || '')) || !Array.isArray(game.moves)) return false;
+    if(loadFailed || !saveStudyNow())return false;
+    const id = ++gameLoadId;
+    stopActiveNavigation(); resetTransport(); panelView = null;
+    gameLoading = {title:archivedTitle(game)}; wrap.classList.add('game-loading');
+    if (repertoirePanel) repertoirePanel.beginGame(); renderPanel();
+    try {
+      // Build off-screen without changing the saved board. Yield long games in small
+      // slices; a newer game or Back invalidates this import before it can commit.
+      const probe = new Chess(game.initial_fen || START_FEN), initialFen = probe.fen();
+      const temporary = {children:[]}; let parent = temporary, count = 0, slice = performance.now();
+      for (const item of game.moves) {
+        if (id !== gameLoadId) return false;
+        const uci = String(item && item.uci || '');
+        const san = item && item.san;
+        if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci) && !(uci==='' && typeof san==='string' && san.length<=12)) throw new Error('Invalid archived move');
+        const number = probe.moveNumber(), mover = probe.turn();
+        const move = probe.move(uci ? {from:uci.slice(0,2),to:uci.slice(2,4),promotion:uci[4]} : san);
+        const child = {id:++count,fen:probe.fen(),san:move.san,move:{from:move.from,to:move.to,promotion:move.promotion || null},number,color:mover,parent,children:[],selectedChild:null};
+        parent.children.push(child); parent.selectedChild = child; parent = child;
+        if (performance.now() - slice >= 6) { await new Promise(resolve => setTimeout(resolve,0)); slice = performance.now(); }
+      }
+      if (id !== gameLoadId) return false;
+      restoring = true;
+      resetRoot(initialFen,{gameId:String(game.id),initialFen,title:archivedTitle(game),subtitle:String(game.result || 'Completed game')});
+      root.children = temporary.children; root.children.forEach(child => child.parent = root);
+      root.selectedChild = mainlineChild(root); nodeId = count; cursor = parent === temporary ? root : parent; chess.load(cursor.fen);
+      const black = game.mobile_orientation === 'black';
+      wrap.classList.toggle('orientation-black',black); wrap.classList.toggle('orientation-white',!black);
+      if (black !== (ground.state.orientation === 'black')) ground.toggleOrientation();
+      const openedRepertoire = gameLoading.repertoireId;
+      tab = gameLoading.tab || 'moves'; document.querySelectorAll('.tabs [data-tab]').forEach(item => item.classList.toggle('selected',item.dataset.tab === tab));
+      stopGameLoad(); sync(null); restoring = false; saveStudyNow();
+      if (repertoirePanel) repertoirePanel.setActive(analysisActive,false);
+      onPositionChanged(); if(openedRepertoire && repertoirePanel)repertoirePanel.openLibrary(openedRepertoire); return true;
+    } catch (_) {
+      if (id === gameLoadId) { stopGameLoad(); restoring = false; if(repertoirePanel)repertoirePanel.setActive(analysisActive,false); onPositionChanged(); }
+      return false;
+    }
+  }
+  function renderActivePanel() { if (panelView || tab === 'repertoire') heading(); else renderPanel(); }
+  // Process every stream message immediately, but paint only the latest state per
+  // frame. Engine progress must not rebuild the unrelated notation/book panels.
+  function queueAnalysisRender(arrowsChanged = false) {
+    engine.arrowsPending = engine.arrowsPending || arrowsChanged;
+    if (engine.renderFrame != null) return;
+    engine.renderFrame = requestAnimationFrame(() => {
+      engine.renderFrame = null;
+      const redrawArrows = engine.arrowsPending; engine.arrowsPending = false;
+      if (!analysisActive || document.hidden || gameLoading || editingPosition()) return;
+      if (redrawArrows) renderArrows(engine.lines);
+      if (!panelView && (tab === 'engine' || tab === 'info' || (tab === 'chart' && redrawArrows))) renderPanel(); else heading();
+    });
+  }
+  function watchAnalysis() {
+    if(engine.watchdog)clearTimeout(engine.watchdog);
+    const id=engine.requestId;
+    engine.watchdog=setTimeout(()=>{if(id && engine.requestId===id)recoverAnalysis();},45000);
+  }
+  function recoverAnalysis() {
+    stopEngineTransport();
+    if(!analysisActive || (!settings.enabled && !fish.server) || gameLoading || editingPosition() || document.hidden)return;
+    if(engine.attempts>=3){engine.status='error';engine.error='Analysis interrupted. Open Engine and tap Retry.';renderActivePanel();return;}
+    engine.attempts++;scheduleAnalysis(true);
+  }
+  function scheduleAnalysis(retry=false) {
+    if(gameLoading || editingPosition() || (repertoirePanel && repertoirePanel.isLibrary()))return;
+    if(!analysisActive){resetTransport();return;}
+    if (!retry) startPhoneFish();
+    if(!settings.enabled && !fish.server){clearEngine('off');renderActivePanel();return;}
+    if(!native()){engine.status='disconnected';renderActivePanel();return;}
+    stopEngineTransport();if(!retry)engine.attempts=0;engine.received=false;
+    engine.status=retry?'retrying':'starting';engine.error=retry?'Connection interrupted. Retrying this position…':'';renderActivePanel();
+    engine.timer=setTimeout(()=>{
+      engine.timer=null;if(!analysisActive || (!settings.enabled && !fish.server) || document.hidden)return;
+      try{engine.requestId=native().startAnalysis(JSON.stringify(studyRequest()));watchAnalysis();}catch(_){recoverAnalysis();}
+    },retry?Math.min(5000,1000*2**(engine.attempts-1)):120);
+  }
+  function requestBook() { if (gameLoading || editingPosition()) return;  if (!analysisActive || tab !== 'book' || !native()) { cancelBookRequest(); renderActivePanel(); return; } cancelBookRequest(); bookSettingsDirty = false; book.loading = true; book.error = ''; renderActivePanel(); try { book.requestId = native().requestExplorer(JSON.stringify({...explorerRequest(),fen:chess.fen()})); } catch (_) { book.loading = false; book.error = 'Connection unavailable'; renderActivePanel(); } }
+  function projectAnalysisToChild(data, move, targetNodes) {
+    const selectedMove = String(move || '');
+    if (!data || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(selectedMove)) return null;
+    const sourceLine = (data.lines || []).find(line => line && line.pv && line.pv[0] === selectedMove);
+    const sourceStat = (data.move_stats || []).find(stat => stat && stat.uci === selectedMove);
+    if (!sourceLine && !sourceStat) return null;
+    const visits = finiteMetric(sourceStat && sourceStat.visits);
+    const continuation = sourceLine && Array.isArray(sourceLine.pv) ? sourceLine.pv.slice(1) : [];
+    const continuationSan = sourceLine && Array.isArray(sourceLine.san) ? sourceLine.san.slice(1) : [];
+    const inheritedEval = sourceLine ? {
+      white_score: sourceLine.white_score,
+      white_cp: sourceLine.white_cp,
+      white_mate: sourceLine.white_mate,
+    } : null;
+    return Object.assign({}, data, {
+      inherited:true,
+      inherited_eval:inheritedEval,
+      root_move_stats:[],
+      move_stats:[],
+      actual_nodes:visits,
+      total_nodes:visits === null ? data.total_nodes : visits,
+      target_nodes:targetNodes == null ? data.target_nodes : targetNodes,
+      progress:null,
+      lines:continuation.length ? [Object.assign({}, sourceLine, { multipv:1, pv:continuation, san:continuationSan })] : [],
+    });
+  }
+  function inheritAnalysisToChild(parent, child) {
+    if (!parent || !child || child.parent !== parent) return;
+    const projected = projectAnalysisToChild(parent.analysisCache || engine.stats, moveUci(child), settings.nodes);
+    if (projected && (!child.analysisCache || child.analysisCache.inherited)) child.analysisCache = projected;
+  }
+  function joinedPositiveLines(data) { const stats = Array.isArray(data && data.move_stats) ? data.move_stats.filter(stat => finiteMetric(stat && stat.visits) > 0) : []; const byMove = new Map(stats.map(stat => [stat.uci, stat])); return { lines:(Array.isArray(data && data.lines) ? data.lines : []).filter(line => line && Array.isArray(line.pv) && byMove.has(line.pv[0])), stats }; }
+  function coherentAnalysisSnapshot(data, targetNodes) { if (!data || !Array.isArray(data.lines) || data.search_phase === 'provisional') return null; const joined = joinedPositiveLines(data), authoritative = data.search_phase === 'ready' || data.search_phase === 'final'; if (!joined.lines.length && !authoritative) return null; return Object.assign({}, data, { inherited:false, mobile_backend:settings.backend, target_nodes:targetNodes == null ? data.target_nodes : targetNodes, lines:joined.lines, move_stats:joined.stats }); }
+  function applyAnalysisSnapshot(snapshot, status, redraw = true) { engine.lastGood = snapshot; engine.lines = snapshot && Array.isArray(snapshot.lines) ? snapshot.lines : []; engine.stats = snapshot || null; engine.progress = snapshot && snapshot.progress || null; engine.status = status || 'cached'; engine.error = ''; if (redraw) renderArrows(engine.lines); }
+  function restoreCachedAnalysis() { const cached = cursor.analysisCache, target = finiteMetric(cached && cached.target_nodes); if (cached && target === settings.nodes && cached.mobile_backend === settings.backend) applyAnalysisSnapshot(cached, cached.inherited ? 'inherited' : 'cached'); else { engine.status = 'idle'; engine.lastGood = null; engine.lines = []; engine.stats = null; engine.progress = null; engine.error = ''; renderArrows([]); } }
+  function onPositionChanged() { if (gameLoading || editingPosition()) return; if (repertoirePanel) repertoirePanel.refresh(); resetTransport(); restoreCachedAnalysis(); scheduleAnalysis(); if (tab === 'book') requestBook(); renderActivePanel(); }
+  function finiteMetric(value) { if (value === null || value === undefined || value === '') return null; const number = Number(value); return Number.isFinite(number) ? number : null; }
+  function compactCount(value) { const number = Math.max(0, finiteMetric(value) || 0); if (number >= 1000000) return (number / 1000000).toFixed(number >= 10000000 ? 0 : 1).replace(/\.0$/, '') + 'M'; if (number >= 1000) return (number / 1000).toFixed(number >= 100000 ? 0 : 1).replace(/\.0$/, '') + 'K'; return String(Math.round(number)); }
+  function whiteEvalText(line) { if (line && line.white_score != null && line.white_score !== 'n/a') return String(line.white_score); const mate = finiteMetric(line && line.white_mate); if (mate !== null) return '#' + mate; const cp = finiteMetric(line && line.white_cp); return cp === null ? '—' : (cp / 100 >= 0 ? '+' : '') + (cp / 100).toFixed(2); }
+  function rememberFishScore(source,line) {
+    (cursor.folioScores || (cursor.folioScores={}))[source]=whiteEvalText(line);
+  }
+  function chartPanel() {
+    const path=[];for(let node=cursor;node && path.length<48;node=node.parent)path.push(node);
+    path.reverse();
+    const list=Object.create(null);
+    for(const [i,node] of path.entries()) {
+      const scores={...node.folioScores}, cache=node.analysisCache;
+      if(cache && !cache.inherited && cache.lines?.length)scores.Leela=whiteEvalText(cache.lines[0]);
+      for(const [engine,score] of Object.entries(scores)) {
+        const value=score.startsWith('#')?(score.includes('-')?-8:8):Number(score);
+        if(!Number.isFinite(value))continue;
+        (list[engine] || (list[engine]=[])).push({i,value,score,san:node.san || 'Start'});
+      }
+    }
+    const rows=Object.entries(list).map(([label,points])=>{
+      const last=points[points.length-1];
+      const x=p=>8+224*p.i/Math.max(1,path.length-1), y=p=>36-3.5*Math.max(-8,Math.min(8,p.value));
+      const marks=points.map((p,n)=>((n && points[n-1].i===p.i-1)?'<line x1="'+x(points[n-1])+'" y1="'+y(points[n-1])+'" x2="'+x(p)+'" y2="'+y(p)+'"/>':'')+'<circle cx="'+x(p)+'" cy="'+y(p)+'" r="2.8"/>').join('');
+      return '<section class="score-trace"><h3>'+safe(label)+'<span>'+safe(last.score)+'</span></h3><svg role="img" aria-label="Recent measured evaluations, White perspective" viewBox="0 0 240 72"><path d="M0 36h240"/>'+marks+'</svg><small>'+safe(points[0].san)+' – '+safe(last.san)+'</small></section>';
+    }).join('');
+    return rows || '<div class="trace-empty"><strong>No measured scores yet</strong><p>This chart records engine evaluations along the current line during this session.</p><button data-open-engines>Engine settings</button></div>';
+  }
+  function engineMoveStats() { const stats = engine.stats || {}; const source = Array.isArray(stats.move_stats) && stats.move_stats.length ? stats.move_stats : (Array.isArray(stats.root_move_stats) ? stats.root_move_stats : []); return new Map(source.map(item => [item.uci, item])); }
+  function leelaStatBar(rootStat, totalVisits) { const prior = finiteMetric(rootStat && rootStat.prior), visits = finiteMetric(rootStat && rootStat.visits); const priorPercent = prior === null ? 0 : Math.max(0, Math.min(100, prior * 100)); const visitPercent = visits === null || totalVisits <= 0 ? 0 : Math.max(0, Math.min(100, visits / totalVisits * 100)); const label = 'Prior ' + (prior === null ? 'unknown' : priorPercent.toFixed(1) + '%') + '; ' + (visits === null ? 'unknown visits' : compactCount(visits) + ' visits, ' + visitPercent.toFixed(1) + '% of root visits'); return '<svg class="leela-stat-bar" viewBox="0 0 100 8" role="img" aria-label="' + safe(label) + '"><rect class="stat-track" width="100" height="8" rx="4"/><rect class="stat-prior" width="' + priorPercent + '" height="4"/><rect class="stat-visits" y="4" width="' + visitPercent + '" height="4"/></svg>'; }
+  function leelaPanel() {
+    const status = engine.progress ? ' ' + safe(engine.progress.visits || 0) + '/' + safe(engine.progress.target || settings.nodes) : engine.status === 'starting' ? ' starting' : engine.status === 'disconnected' ? ' disconnected' : '';
+    const rootStats = engineMoveStats();
+    const stats = engine.stats || {}; const statValues = [...rootStats.values()]; const reportedRootVisits = finiteMetric(stats.total_nodes != null ? stats.total_nodes : stats.nodes); const summedRootVisits = statValues.reduce((total, stat) => total + Math.max(0, finiteMetric(stat.visits) || 0), 0); const totalRootVisits = reportedRootVisits !== null && reportedRootVisits > 0 ? reportedRootVisits : summedRootVisits; const rows = engine.lines.length ? engine.lines.map((line, index) => { const rootMove = Array.isArray(line.pv) ? line.pv[0] : ''; const rootStat = rootStats.get(rootMove) || {}; const visits = finiteMetric(rootStat.visits); const prior = finiteMetric(rootStat.prior); const statText = (visits === null ? '— visits' : compactCount(visits) + ' visits') + ' · ' + (prior === null ? '— prior' : (Math.max(0, Math.min(100, prior * 100))).toFixed(1) + '% prior'); return '<button class="pv" data-pv="' + index + '" data-pv-uci="' + safe(rootMove) + '"><strong>' + safe(whiteEvalText(line)) + leelaStatBar(rootStat, totalRootVisits) + '</strong><span class="pv-copy"><small>' + safe(statText) + '</small><span>' + safe((line.san || []).join(' ') || (line.pv || []).join(' ')) + '</span></span></button>'; }).join('') : '<div class="empty">' + (engine.error ? safe(privacy.error(engine.error,'Leela unavailable. Check the PC connection or retry analysis.')) : 'Waiting for Leela…') + '</div>';
+    const progress = engine.progress || {}, visits = progress.visits || 0;
+    const notice=engine.lines.length && engine.error ? '<div class="empty" role="status">'+safe(privacy.error(engine.error,'Leela unavailable. Retry analysis.'))+'</div>' : '';
+    return notice + '<div class="stats"><span><b>visits:</b> ' + safe(visits) + '/' + safe(progress.target || settings.nodes) + '</span><span><b>nodes:</b> ' + safe(stats.total_nodes || stats.nodes || visits) + '</span><span><b>n/s:</b> ' + safe(stats.nps || progress.nps || 0) + '</span><span><b>time:</b> ' + safe(stats.elapsed_ms != null ? Math.round(stats.elapsed_ms / 1000) + 's' : '—') + '</span></div>' + rows + (engine.status==='error' || engine.status==='disconnected' ? '<button class="rep-button" data-engine-retry>Retry Leela</button>' : '');
+  }
+  function stockfishPanel(label,lines,message) {
+    return (lines.length ? lines.map(line=>{
+      const uci=line.pv[0], pv=line.san || (line.san=fishSan(line.pv));
+      return '<button class="pv" data-uci="'+safe(uci)+'"><strong>'+safe(whiteEvalText(line))+'</strong><span class="pv-copy"><small>Depth '+safe(line.depth)+'</small>'+safe(pv.join(' '))+'</span></button>';
+    }).join('') : '<div class="empty">'+safe(message || 'Waiting for analysis…')+'</div>');
+  }
+  function fishSan(pv) {
+    const board=new Chess(chess.fen()), moves=[];
+    for(const u of pv){try{moves.push(board.move({from:u.slice(0,2),to:u.slice(2,4),promotion:u[4]}).san);}catch(_){break;}}
+    return moves;
+  }
+  function enginePanel() {
+    const pane=(id,label,body)=>'<section class="engine-pane '+id+'"><header>'+label+'</header><div class="engine-lines" data-scroll="'+id+'">'+body+'</div></section>';
+    const sf=(id,label,lines,error)=>pane(id,label+' <b>'+safe(whiteEvalText(lines[0]))+'</b>',stockfishPanel(label,lines,error));
+    const parts=[];
+    if(fish.server)parts.push(sf('pc','Stockfish · PC',fish.pcLines,fish.pcError || (engine.error?'PC analysis unavailable.':'')));
+    if(fish.local!=='off')parts.push(sf('phone','Stockfish · phone',fish.phoneLines,fish.error));
+    if(settings.enabled)parts.push(pane('leela','Leela <b>'+safe(whiteEvalText(engine.lines[0] || engine.stats?.inherited_eval))+'</b>',leelaPanel()));
+    if(!parts.length)return '<div class="empty">Engines off · use the settings gear to enable analysis.</div>';
+    return '<div class="engine-split">'+parts.join('')+
+      (!settings.enabled && (engine.error || fish.error || fish.pcError)?'<button data-engine-retry>Retry analysis</button>':'')+'</div>';
+  }
+  function moveMarkup(child, variationRoot) { const number = child.color === 'w' ? child.number + '.' : variationRoot ? child.number + '...' : ''; return '<button class="move ' + (child === cursor ? 'current' : '') + '" data-node="' + child.id + '">' + (number ? '<span class="no">' + number + '</span>' : '') + safe(child.san) + '</button>'; }
+  function renderMoves(node) {
+    const parts=[],stack=[node];
+    while(stack.length){const next=stack.pop();if(typeof next==='string'){parts.push(next);continue;}if(!next.children.length)continue;
+      if(next.children.length===1){parts.push(moveMarkup(next.children[0],false));stack.push(next.children[0]);}
+      else {parts.push('<div class="variations">');stack.push('</div>');for(let i=next.children.length-1;i>=0;i--){const child=next.children[i];stack.push('</div>',child,'<div class="variation">'+moveMarkup(child,true));}}
+    }return parts.join('');
+  }
+  function movesPanel() { return root.children.length ? '<div class="moves">' + renderMoves(root) + '</div>' : '<div class="empty">Tap or drag a legal move to begin a local line.</div>'; }
+  function resultPercentages(result) { const games = finiteMetric(result.games) || (finiteMetric(result.white) || 0) + (finiteMetric(result.draws) || 0) + (finiteMetric(result.black) || 0); const requested = [finiteMetric(result.white_pct), finiteMetric(result.draw_pct), finiteMetric(result.black_pct)]; const counts = [finiteMetric(result.white) || 0, finiteMetric(result.draws) || 0, finiteMetric(result.black) || 0]; const values = requested.every(value => value !== null) ? requested : counts.map(value => games > 0 ? 100 * value / games : 0); const total = values.reduce((sum, value) => sum + Math.max(0, value), 0); return total > 0 ? values.map(value => Math.max(0, value) * 100 / total) : [0, 0, 0]; }
+  function resultBar(result, index) { const values = resultPercentages(result); const white = values[0], draw = values[1], black = values[2], whiteEnd = white, drawEnd = white + draw; const label = Math.round(white) + '% white, ' + Math.round(draw) + '% draws, ' + Math.round(black) + '% black'; const percent = value => Math.max(0, Math.min(100, value)) + '%'; const text = (value, x, className) => value < 13 ? '' : '<text' + (className ? ' class="' + className + '"' : '') + ' x="' + percent(x) + '" y="14">' + Math.round(value) + '%</text>'; return '<svg class="result-bar" role="img" aria-label="' + safe(label) + '"><defs><clipPath id="book-bar-' + index + '"><rect width="100%" height="20" rx="10"/></clipPath></defs><g clip-path="url(#book-bar-' + index + ')"><rect class="result-white" width="' + percent(white) + '" height="20"/><rect class="result-draw" x="' + percent(whiteEnd) + '" width="' + percent(draw) + '" height="20"/><rect class="result-black" x="' + percent(drawEnd) + '" width="' + percent(black) + '" height="20"/></g><rect class="result-outline" x="0.25%" y="0.5" width="99.5%" height="19" rx="9.5"/>' + text(white, white / 2, 'on-white') + text(draw, white + draw / 2, '') + text(black, drawEnd + black / 2, '') + '</svg>'; }
+  function bookPanel() { if (book.loading) return '<div class="empty">Opening book…</div>'; if (book.error) return '<div class="empty">' + safe(privacy.error(book.error,'Opening book unavailable. Check the PC connection or retry.')) + '</div>'; if (!book.data) return '<div class="empty">Opening book is ready when connected.</div>'; const total = book.data.totals || {}; const totalGames = finiteMetric(total.games) || 0; const sourceMoves = Array.isArray(book.data.moves) ? book.data.moves : []; if (!totalGames || !sourceMoves.length) return '<div class="empty">No explorer moves for this position.</div>'; const summary = '<div class="book-move book-summary"><b>Σ</b><span class="book-share">100%</span><span class="book-games">' + safe(compactCount(totalGames)) + '</span>' + resultBar(total, 'total') + '</div>'; const moves = sourceMoves.map((move, index) => { const games = finiteMetric(move.games) || 0; const reportedShare = finiteMetric(move.share_pct); const share = reportedShare === null ? (totalGames > 0 ? Math.max(0, Math.min(100, games / totalGames * 100)) : 0) : Math.max(0, Math.min(100, reportedShare)); return '<button class="book-move" data-uci="' + safe(move.uci) + '"><b>' + safe(move.san || move.uci) + '</b><span class="book-share">' + Math.round(share) + '%</span><span class="book-games">' + safe(compactCount(games)) + '</span>' + resultBar(move, index) + '</button>'; }).join(''); return '<div class="book-moves">' + moves + summary + '</div>'; }
+  function switchButton(name, label, enabled) { return '<button class="touch-switch' + (enabled ? ' on' : '') + '" data-switch="' + name + '" role="switch" aria-checked="' + enabled + '"><span>' + label + '</span><i aria-hidden="true"></i></button>'; }
+  function filterSummary(values) { return values.length ? values.join(' · ') : 'All'; }
+  function chip(value, label, selected) { return '<button class="filter-chip' + (selected ? ' selected' : '') + '" data-filter="' + safe(value) + '" aria-pressed="' + selected + '">' + safe(label) + '</button>'; }
+  function panelViewHtml() {
+    if (panelView === 'repertoireSettings') return repertoirePanel ? privacy.html(repertoirePanel.settingsHtml()) : '';
+    if (panelView === 'settings') {
+      const row=(label,key,min,max,value,readout)=>'<label class="range-row"><span>'+label+'</span><b data-'+key+'-readout>'+readout+'</b><input data-'+key+' type="range" min="'+min+'" max="'+max+'" value="'+value+'" aria-label="'+label+'"></label>';
+      const selector='<div class="settings-segments">'+['Board','Leela','Stockfish'].map(s=>'<button data-section="'+s+'" aria-pressed="'+(s===settingsSection)+'">'+s+'</button>').join('')+'</div>';
+      let controls;
+      if(settingsSection==='Leela')controls=
+        '<div class="backend-row"><span>Engine</span><button data-backend="cpu" class="'+(settings.backend==='cpu'?'selected':'')+'">CPU · safe</button><button data-backend="sycl" class="'+(settings.backend==='sycl'?'selected':'')+'">iGPU · exact</button></div>'+
+        row('Nodes','nodes',0,NODE_OPTIONS.length-1,NODE_OPTIONS.indexOf(settings.nodes),compactCount(settings.nodes))+
+        row('Lines','leela-lines',0,8,settings.leelaLines,settings.leelaLines||'All')+switchButton('leela','Leela',settings.enabled);
+      else if(settingsSection==='Stockfish'){
+        const opt=(key,label,active)=>'<button data-fish="'+key+'" aria-pressed="'+active+'">'+label+'</button>';
+        controls='<div class="fish-source"><span>PC</span>'+opt('server',fish.server?'On':'Off',fish.server)+'</div>'+
+          '<div class="fish-source"><span>Phone</span>'+opt('off','Off',fish.local==='off')+['lite','full'].map(key=>opt(key,(fish[key]?'':'↓ ')+(key==='lite'?'Lite':'Full'),fish.local===key)).join('')+'</div>'+
+          row('Lines','sf-lines',1,8,settings.sfLines,settings.sfLines)+(fish.local==='off'?'':row('Phone depth','sf-depth',8,24,settings.sfDepth,settings.sfDepth))+
+          '<small role="status">'+safe(fish.download || 'Lite 1.9 MB · Full 99 MB')+'</small>';
+      }else controls=row('Arrows','arrow-count',1,8,settings.arrowCount,settings.arrowCount)+
+        '<div class="arrow-mode-row" role="group" aria-label="Move arrows">'+['best','maneuver'].map(m=>'<button data-arrow-mode="'+m+'" aria-pressed="'+(settings.arrowMode===m)+'">'+(m==='best'?'Best moves':'Best + maneuver')+'</button>').join('')+'</div>'+
+        '<div class="switch-row">'+switchButton('arrows','Arrows',settings.showArrows)+switchButton('smartInput','One tap',settings.smartInput)+'</div>';
+      return '<div class="panel-view compact-settings">'+selector+controls+'</div>';
+    }
+    if (panelView === 'bookSettings') return '<div class="panel-view book-settings">' +
+      '<div class="source-row"><button data-source="masters" aria-pressed="' + (settings.bookSource === 'masters') + '" class="' + (settings.bookSource === 'masters' ? 'selected' : '') + '">Masters</button><button data-source="lichess" aria-pressed="' + (settings.bookSource === 'lichess') + '" class="' + (settings.bookSource === 'lichess' ? 'selected' : '') + '">Lichess</button></div>' +
+      (settings.bookSource === 'lichess' ? '<div class="filter-title">Speed <small>' + safe(filterSummary(settings.bookSpeeds)) + '</small></div><div class="filter-grid filter-five">' + BOOK_SPEEDS.map(value => chip(value, value === 'correspondence' ? 'Corr.' : value[0].toUpperCase() + value.slice(1), settings.bookSpeeds.includes(value))).join('') + '</div><div class="filter-title">Rating <small>' + safe(filterSummary(settings.bookRatings)) + '</small></div><div class="filter-grid filter-five">' + BOOK_RATINGS.map(value => chip(value, value, settings.bookRatings.includes(value))).join('') + '</div>' : '') + '</div>';
+    if (panelView === 'confirmReset') return '<div class="panel-view"><p>Reset this study to the starting position? Its move tree will be cleared.</p><div class="panel-buttons"><button data-confirm-reset>Reset study</button><button data-cancel-reset>Keep study</button></div></div>';
+    if (panelView === 'confirmDelete') return '<div class="panel-view"><p>Delete the current branch?</p><div class="panel-buttons"><button data-confirm-delete>Delete</button><button data-cancel-delete>Keep</button></div></div>';
+    if (panelView === 'variationActions') return '<div class="panel-view"><div class="panel-readout"><span>Variation</span><b>' + safe(variationTarget && variationTarget.san || '') + '</b></div><div class="panel-buttons panel-buttons-stack"><button data-promote-variation>Promote to main line</button><button data-delete-variation>Delete variation</button><button data-cancel-variation>Cancel</button></div></div>';
+    return '<div class="panel-view"><div class="panel-buttons panel-buttons-stack"><button data-editor>Board editor</button>' + (studyContext.editedPosition ? '<button data-source-board>Return to saved board</button>' : '') + '<button data-reset>Reset this study</button><button data-delete' + (cursor.parent ? '' : ' disabled') + '>Delete current branch</button></div></div>';
+  }
+  function heading() {
+    // Only transition the chrome when the active surface changes; engine frames are frequent.
+    const sheet = ({ settings:'Preferences',bookSettings:'Explorer filters',study:'Study tools',confirmDelete:'Delete branch',confirmReset:'Reset study',variationActions:'Variation' })[panelView] || '';
+    if ((document.body.dataset.folioSheet || '') !== sheet) {
+      document.body.dataset.folioSheet = sheet;
+      document.getElementById('folio-sheet-name').textContent = sheet;
+      refreshBoardBounds();
+    }
+    const both=fish.server && fish.local!=='off', scores=[];
+    if(fish.server)scores.push(whiteEvalText(gameLoading ? null : fish.pcLines[0])+' · '+(both?'SF PC':'Stockfish'));
+    if(fish.local!=='off')scores.push(whiteEvalText(gameLoading ? null : fish.phoneLines[0])+' · '+(both?'SF phone':'Stockfish'));
+    sfScore.hidden=!scores.length; sfScore.textContent=scores.map(score=>score.replace(/ /g, '\u00a0')).join('  ');
+    title.hidden=!settings.enabled && scores.length>0;
+    const best=gameLoading ? null : (engine.lines[0] || engine.stats?.inherited_eval);
+    title.textContent=settings.enabled?whiteEvalText(best)+' · Leela':({moves:'Moves',info:'Position',engine:'Engines off',chart:'',book:'Opening book',repertoire:'Repertoires'})[tab];
+    if(gameLoading) { document.querySelector('[data-study-title]').textContent=privacy.title(gameLoading.title,true);document.querySelector('.game-title small').textContent='Loading game…';return; }
+    document.querySelector('[data-study-title]').textContent = repertoirePanel && repertoirePanel.isLibrary() ? 'Repertoires' : privacy.title(studyContext.title,!!studyContext.gameId); document.querySelector('[data-panel-tab]').hidden = !panelView; document.querySelector('[data-panel-tab]').classList.toggle('selected', !!panelView);  const marker = document.querySelector('[data-tab="repertoire"]'), summary = repertoirePanel ? privacy.text(repertoirePanel.summary()) : ''; if (marker) { marker.setAttribute('title', summary || 'Repertoires'); marker.classList.toggle('rep-covered', !!summary && !summary.startsWith('Outside') && !summary.includes('deviation')); marker.classList.toggle('rep-deviated', summary.startsWith('Outside') || summary.includes('deviation')); } if (repertoirePanel && repertoirePanel.isLibrary()) document.querySelector('.game-title small').textContent = ''; else if (summary) { const subtitle = document.querySelector('.game-title small'); subtitle.textContent = (cursor.san || privacy.subtitle(studyContext.subtitle)) + ' · ' + summary; } if(!summary && clickChoice && clickChoice.current===cursor)document.querySelector('.game-title small').textContent=cursor.san+' · drag back to '+cursor.move.from+' to undo'; else if(!summary && clickChoice && !clickChoice.current && clickChoice.parent===cursor)document.querySelector('.game-title small').textContent='Tap '+clickChoice.to+' for '+(clickChoice.ranking.length>1?'the next piece':'the move'); else if(!summary && !(repertoirePanel && repertoirePanel.isLibrary()))document.querySelector('.game-title small').textContent=cursor.san || (studyContext.gameId?privacy.subtitle(studyContext.subtitle):''); }
+  function closePanelView() { const refreshBook = panelView === 'bookSettings' && bookSettingsDirty; panelView = null; variationTarget = null; if (refreshBook) { bookSettingsDirty = false; requestBook(); } renderPanel(); scheduleStudySave(); }
+  function clearAnalysisCaches(node) { delete node.analysisCache; node.children.forEach(clearAnalysisCaches); }
+  function persistBookSettings() { saveUiSettings(); cancelBookRequest(); book.data = null; bookSettingsDirty = true; }
+  function bindPanelView() {
+    if(panelView==='settings'){
+      panel.querySelectorAll('[data-fish]').forEach(button=>button.onclick=()=>{
+        const key=button.dataset.fish;
+        if(key==='leela'){ settings.enabled=!settings.enabled; saveUiSettings(); }
+        else if(key==='server'){fish.server=!fish.server;native()?.setStockfishOptions?.(fish.local,fish.server);}
+        else if(key==='off' || fish[key]){fish.wanted=null;fish.local=key;native()?.setStockfishOptions?.(key,fish.server);}
+        else {if(fish.pendingPack)return;fish.pendingPack=fish.wanted=key;native()?.downloadStockfish?.(key);fish.download='Downloading '+key+'…';renderPanel();return;}
+        localFish.close();resetTransport();clearEngine('idle');if(settings.enabled)restoreCachedAnalysis();
+        scheduleAnalysis();renderPanel();
+      });
+    }
+    if (panelView === 'repertoireSettings') { if (repertoirePanel) repertoirePanel.bind(panel); return; }
+    if (panelView === 'settings') {
+      panel.querySelectorAll('[data-section]').forEach(b=>b.onclick=()=>{settingsSection=b.dataset.section;renderPanel();});
+      for(const [key,field] of [['sf-lines','sfLines'],['sf-depth','sfDepth'],['leela-lines','leelaLines']]){
+        const slider=panel.querySelector('[data-'+key+']');if(!slider)continue;
+        slider.oninput=()=>panel.querySelector('[data-'+key+'-readout]').textContent=Number(slider.value)||'All';
+        slider.onchange=()=>{settings[field]=Number(slider.value);saveUiSettings();if(field==='leelaLines')clearAnalysisCaches(root);
+          resetTransport();clearEngine('idle');if(settings.enabled)restoreCachedAnalysis();scheduleAnalysis();};
+      }
+      const nodes = panel.querySelector('[data-nodes]'), arrowsControl = panel.querySelector('[data-arrow-count]');
+      panel.querySelectorAll('[data-backend]').forEach(button => button.onclick = () => { const next = button.dataset.backend; if ((next !== 'cpu' && next !== 'sycl') || next === settings.backend) return; settings.backend = next; clearAnalysisCaches(root); saveUiSettings(); clearEngine('idle'); renderPanel(); scheduleAnalysis(); });
+      if(nodes)nodes.oninput = () => { panel.querySelector('[data-nodes-readout]').textContent = compactCount(NODE_OPTIONS[Number(nodes.value)]); };
+      if(nodes)nodes.onchange = () => { const next = NODE_OPTIONS[Number(nodes.value)]; if (next === settings.nodes) return; settings.nodes = next; clearAnalysisCaches(root); saveUiSettings(); restoreCachedAnalysis(); scheduleAnalysis(); };
+      if(arrowsControl)arrowsControl.oninput = () => { settings.arrowCount = clampInteger(arrowsControl.value, 1, 8, settings.arrowCount); panel.querySelector('[data-arrow-count-readout]').textContent = settings.arrowCount; renderArrows(engine.lines); };
+      if(arrowsControl)arrowsControl.onchange = saveUiSettings;
+      panel.querySelectorAll('[data-arrow-mode]').forEach(button => button.onclick = () => {
+        settings.arrowMode = button.dataset.arrowMode;
+        panel.querySelectorAll('[data-arrow-mode]').forEach(item => item.setAttribute('aria-pressed',item.dataset.arrowMode === settings.arrowMode));
+        saveUiSettings(); renderArrows(engine.lines);
+      });
+      panel.querySelectorAll('[data-switch]').forEach(button => button.onclick = () => { const key = button.dataset.switch; if(key==='smartInput'){settings.smartInput=!settings.smartInput;clearClickChoice();button.classList.toggle('on',settings.smartInput);button.setAttribute('aria-checked',settings.smartInput);saveUiSettings();return;} if (key === 'leela') settings.enabled = !settings.enabled; else settings.showArrows = !settings.showArrows; button.classList.toggle('on', key === 'leela' ? settings.enabled : settings.showArrows); button.setAttribute('aria-checked', key === 'leela' ? settings.enabled : settings.showArrows); saveUiSettings(); renderArrows(engine.lines); if (key === 'leela') { if (settings.enabled) { restoreCachedAnalysis(); scheduleAnalysis(); } else {clearEngine('off');scheduleAnalysis();} } });
+    } else if (panelView === 'bookSettings') {
+      panel.querySelectorAll('[data-source]').forEach(button => button.onclick = () => { const source = button.dataset.source; if (source === settings.bookSource) return; settings.bookSource = source; persistBookSettings(); renderPanel(); });
+      panel.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => { const raw = button.dataset.filter, rating = BOOK_RATINGS.includes(Number(raw)), values = rating ? settings.bookRatings : settings.bookSpeeds, value = rating ? Number(raw) : raw, index = values.indexOf(value); if (index >= 0) values.splice(index, 1); else values.push(value); const allowed = rating ? BOOK_RATINGS : BOOK_SPEEDS; values.splice(0, values.length, ...orderedSelection(values, allowed)); persistBookSettings(); renderPanel(); });
+    } else if (panelView === 'study') { panel.querySelector('[data-editor]').onclick = () => openBoardEditor(true); const sourceBoard = panel.querySelector('[data-source-board]'); if(sourceBoard)sourceBoard.onclick = returnToSavedBoard; panel.querySelector('[data-reset]').onclick = () => openPanelView('confirmReset'); const remove = panel.querySelector('[data-delete]'); if (!remove.disabled) remove.onclick = () => { panelView = 'confirmDelete'; renderPanel(); }; }
+    else if (panelView === 'confirmReset') { panel.querySelector('[data-confirm-reset]').onclick = () => { panelView=null;resetStudy(); };panel.querySelector('[data-cancel-reset]').onclick=()=>openPanelView('study'); }
+    else if (panelView === 'confirmDelete') { panel.querySelector('[data-confirm-delete]').onclick = () => { panelView = null; deleteCurrentBranch(); }; panel.querySelector('[data-cancel-delete]').onclick = closePanelView; }
+    else if (panelView === 'variationActions') { panel.querySelector('[data-promote-variation]').onclick = promoteVariation; panel.querySelector('[data-delete-variation]').onclick = deleteVariation; panel.querySelector('[data-cancel-variation]').onclick = closePanelView; }
+  }
+  function bindMoveNode(button) { let held = false, timer = null; const stop = () => { if (timer) clearTimeout(timer); timer = null; }; button.onpointerdown = event => { if (event.pointerType === 'mouse' && event.button !== 0) return; stop(); held = false; const target = findNode(Number(button.dataset.node)); if (!target || !target.parent || target.parent.children.length < 2) return; timer = setTimeout(() => { held = true; variationTarget = target; openPanelView('variationActions'); }, 480); }; button.onpointerup = button.onpointercancel = button.onpointerleave = stop; button.oncontextmenu = event => event.preventDefault(); button.onclick = event => { if (held) { event.preventDefault(); held = false; return; } restore(findNode(Number(button.dataset.node))); }; }
+  function navigationControls() { const prev=document.querySelector('[data-action="prev"]'),next=document.querySelector('[data-action="next"]'),mainline=document.querySelector('[data-action="mainline"]');prev.disabled=!cursor.parent;next.disabled=!mainlineChild(cursor);mainline.disabled=!navigationIntersection();mainline.setAttribute('aria-label',tab==='repertoire'?'Return to intersection':'Return to mainline'); }
+  function renderPanel() { if(!gameLoading && !panelView && tab==='moves' && renderedTreeRevision===treeRevision && panel.querySelector('.moves')) { panel.querySelector('.move.current')?.classList.remove('current');panel.querySelector('[data-node="'+cursor.id+'"]')?.classList.add('current');document.querySelector('.game-title small').textContent=(cursor.san || privacy.subtitle(studyContext.subtitle))+' · '+(chess.turn()==='w'?'White to move':'Black to move');heading();navigationControls();return; } if (gameLoading) { panel.innerHTML = '<div class="empty" role="status">Loading game…</div>'; heading(); for(const name of ['prev','next','mainline']) document.querySelector('[data-action="'+name+'"]').disabled = true; return; }  if (panelView === 'repertoireSettings' && repertoirePanel && repertoirePanel.hasEditorFocus()) { heading(); return; } const preserveEngine = !panelView && tab === 'engine' ? { offsets:new Map([...panel.querySelectorAll('[data-scroll]')].map(el=>[el.dataset.scroll,el.scrollTop])), scrollTop: panel.scrollTop, focusedPv: document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.pv : null } : null; const info = '<div class="empty"><b>Turn:</b> ' + (chess.turn() === 'w' ? 'White' : 'Black') + '<br><b>FEN:</b> ' + safe(chess.fen()) + '<br><b>Leela:</b> ' + safe(engine.status) + '</div>'; document.querySelector('.game-title small').textContent = (cursor.san || privacy.subtitle(studyContext.subtitle)) + ' · ' + (engine.status === 'disconnected' ? 'PC disconnected' : chess.turn() === 'w' ? 'White to move' : 'Black to move'); panel.innerHTML = panelView ? panelViewHtml() : tab === 'engine' ? enginePanel() : tab === 'moves' ? movesPanel() : tab === 'book' ? bookPanel() : tab === 'repertoire' ? (repertoirePanel ? privacy.html(repertoirePanel.html()) : '') : tab === 'info' ? info : chartPanel(); heading(); const preferences=panel.querySelector('[data-open-engines]');if(preferences)preferences.onclick=()=>{settingsSection='Stockfish';openPanelView('settings')}; const retry=panel.querySelector('[data-engine-retry]');if(retry)retry.onclick=()=>scheduleAnalysis(); if (panelView) bindPanelView(); if (!panelView && tab === 'repertoire' && repertoirePanel) repertoirePanel.bind(panel); if(!panelView && tab==='moves')renderedTreeRevision=treeRevision;panel.querySelectorAll('[data-node]').forEach(bindMoveNode); panel.querySelectorAll('[data-uci]').forEach(button => button.onclick = () => playExplorerMove(button.dataset.uci)); panel.querySelectorAll('[data-pv]').forEach(button => button.onclick = () => playUci(button.dataset.pvUci)); if (preserveEngine) { for(const el of panel.querySelectorAll('[data-scroll]'))el.scrollTop=preserveEngine.offsets.get(el.dataset.scroll)||0; panel.scrollTop = preserveEngine.scrollTop; if (preserveEngine.focusedPv != null) { const focused = panel.querySelector('[data-pv="' + preserveEngine.focusedPv + '"]'); if (focused) { focused.focus({ preventScroll:true }); panel.scrollTop = preserveEngine.scrollTop; } } } const prev = document.querySelector('[data-action="prev"]'), next = document.querySelector('[data-action="next"]'), mainline = document.querySelector('[data-action="mainline"]'); prev.disabled = !cursor.parent; next.disabled = !mainlineChild(cursor); mainline.disabled = !navigationIntersection(); mainline.setAttribute('aria-label',tab==='repertoire'?'Return to intersection':'Return to mainline'); }
+  function findNode(id) { if(nodeIndex.has(id))return nodeIndex.get(id);const pending=[root];while(pending.length){const n=pending.pop();nodeIndex.set(n.id,n);pending.push(...n.children);}return nodeIndex.get(id) || null; }
+  function forgetBranch(node) { const pending=[node];while(pending.length){const n=pending.pop();nodeIndex.delete(n.id);dirtyBranches.delete(n.id);pending.push(...n.children);} }
+  function mainlineIntersection(node) { for (let branch = node; branch && branch.parent; branch = branch.parent) if (mainlineChild(branch.parent) !== branch) return branch.parent; return null; }
+  function navigationIntersection() {
+    const notation=mainlineIntersection(cursor);if(tab!=='repertoire' || !repertoirePanel)return notation;
+    const target=repertoirePanel.intersection(),count=history().length;let ply=count;
+    for(let node=cursor;node;node=node.parent,ply--)if(node===notation || (ply===target && ply<count))return node;
+    return notation;
+  }
+  function returnToMainline() { const intersection = navigationIntersection(); if (intersection) restore(intersection); }
+  function restore(next) { clearClickChoice(); if (gameLoading || editingPosition()) return;  if (!next) return; const previous = cursor; if (next.parent === previous) inheritAnalysisToChild(previous, next); cursor = next; restoring = true; chess.load(cursor.fen); sync(null); restoring = false; saveStudyNow(); onPositionChanged(); }
+  function playUci(uci) { if (!uci || uci.length < 4) return; commitMove(uci.slice(0,2), uci.slice(2,4), uci.length > 4 ? uci[4] : undefined); }
+  function playExplorerMove(uci) { playUci(window.InstinctaMoveInput.normalizeUci(uci,legalMoves())); }
+  function flipBoard() { ground.toggleOrientation(); wrap.classList.toggle('orientation-white'); wrap.classList.toggle('orientation-black'); renderArrows(engine.lines); if (repertoirePanel) repertoirePanel.updateMarker(); scheduleStudySave(); }
+  function squarePoint(square) { const f = square.charCodeAt(0) - 97, r = Number(square[1]) - 1, white = !wrap.classList.contains('orientation-black'); return [(white ? f : 7 - f) * 64 + 32, (white ? 7 - r : r) * 64 + 32]; }
+  function lineWinningChance(line) { let cp = finiteMetric(line && line.white_cp); const mate = finiteMetric(line && line.white_mate); if (mate !== null) cp = mate > 0 ? 1000 : -1000; if (cp === null) return null; if (chess.turn() === 'b') cp = -cp; cp = Math.max(-1000, Math.min(1000, cp)); return 2 / (1 + Math.exp(-0.00368208 * cp)) - 1; }
+  function credibleLeelaReferenceQ(moveStats, bestStat) { const bestVisits = Math.max(0, finiteMetric(bestStat && bestStat.visits) || 0); const minimumVisits = Math.max(1, Math.floor(bestVisits * 0.02)); const values = moveStats.filter(stat => (finiteMetric(stat && stat.visits) || 0) >= minimumVisits).map(stat => finiteMetric(stat && stat.q)).filter(q => q !== null); const bestQ = finiteMetric(bestStat && bestStat.q); if (bestQ !== null) values.push(bestQ); return values.length ? Math.max(...values) : null; }
+  function leelaArrowWidthFromMetrics(metrics) { const bestVisits = Number(metrics.bestVisits), alternativeVisits = Number(metrics.alternativeVisits); const reference = metrics.referenceQ === null || metrics.referenceQ === undefined ? Number.NaN : Number(metrics.referenceQ); const alternative = metrics.alternativeQ === null || metrics.alternativeQ === undefined ? Number.NaN : Number(metrics.alternativeQ); let qualityStrength = 1; if (Number.isFinite(reference) && Number.isFinite(alternative)) { const winChanceDrop = Math.max(0, (reference - alternative) / 2); if (winChanceDrop >= 0.16) return null; qualityStrength = 1 - winChanceDrop / 0.16; } if (Number.isFinite(bestVisits) && bestVisits >= 0) { const visitStrength = Math.sqrt(Math.min(1, (Math.max(0, alternativeVisits || 0) + 1) / (bestVisits + 1))); return Math.max(2, Math.min(12, Math.round(2 + 10 * visitStrength * qualityStrength))); } return Math.max(2, 10 - Math.max(0, Number(metrics.fallbackIndex) || 0) * 2); }
+  function rankedLeelaAlternativeLines(lines, statsByMove) { const metric = value => finiteMetric(value); return lines.map((line, index) => ({ line, index, stat: statsByMove.get(line && line.pv && line.pv[0]) })).sort((a, b) => { for (const key of ['visits','q','prior']) { const av = metric(a.stat && a.stat[key]), bv = metric(b.stat && b.stat[key]); if (av === null && bv !== null) return 1; if (av !== null && bv === null) return -1; if (av !== null && bv !== null && av !== bv) return bv - av; } const ar = metric(a.line && a.line.multipv) || a.index + 1, br = metric(b.line && b.line.multipv) || b.index + 1; return ar - br || a.index - b.index; }).map(item => item.line); }
+  function alternativeArrowWidth(bestLine, line, index, moveStats, statsByMove) { const best = statsByMove.get(bestLine && bestLine.pv && bestLine.pv[0]), alternative = statsByMove.get(line && line.pv && line.pv[0]); let referenceQ = credibleLeelaReferenceQ(moveStats, best), alternativeQ = finiteMetric(alternative && alternative.q); if (referenceQ === null || alternativeQ === null) { referenceQ = lineWinningChance(bestLine); alternativeQ = lineWinningChance(line); } return leelaArrowWidthFromMetrics({ bestVisits: best && best.visits, alternativeVisits: alternative && alternative.visits, referenceQ, alternativeQ, fallbackIndex:index }); }
+  // Kept identical to the current web maneuver helpers; see the parity regression.
+  function moveArrowShape(uci, brush, modifiers) {
+    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci || "")) return null;
+    return {
+      orig: uci.slice(0, 2),
+      dest: uci.slice(2, 4),
+      brush,
+      ...(modifiers ? { modifiers } : {}),
+    };
+  }
+  function maneuverArrowShapes(moves, brush) {
+    const shapes = [];
+    const occupied = new Set();
+    const maxPlies = Math.min(moves.length, 6);
+    for (let index = 0; index < maxPlies; index += 2) {
+      const move = moves[index];
+      if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move || "")) break;
+      if (index > 0 && moves[index - 2]?.slice(2, 4) !== move.slice(0, 2)) break;
+      if (arrowPathInterferes(move.slice(0, 2), move.slice(2, 4), occupied)) break;
+      const shape = moveArrowShape(move, brush);
+      if (shape) shapes.push(shape);
+    }
+    return shapes;
+  }
+  function arrowPathInterferes(from, to, occupied) {
+    if (from === to) return true;
+    const [fromFile, fromRank] = squareCoordinates(from);
+    const [toFile, toRank] = squareCoordinates(to);
+    const fileDelta = toFile - fromFile;
+    const rankDelta = toRank - fromRank;
+    occupied.add(from);
+    if ([Math.abs(fileDelta), Math.abs(rankDelta)].sort().join("") === "12") {
+      if (occupied.has(to)) return true;
+      occupied.add(to);
+      return false;
+    }
+    if (!(fileDelta === 0 || rankDelta === 0 || Math.abs(fileDelta) === Math.abs(rankDelta))) {
+      return true;
+    }
+    const fileStep = Math.sign(fileDelta);
+    const rankStep = Math.sign(rankDelta);
+    let file = fromFile + fileStep;
+    let rank = fromRank + rankStep;
+    while (file !== toFile || rank !== toRank) {
+      const square = `${String.fromCharCode(97 + file)}${rank + 1}`;
+      if (occupied.has(square)) return true;
+      occupied.add(square);
+      file += fileStep;
+      rank += rankStep;
+    }
+    if (occupied.has(to)) return true;
+    occupied.add(to);
+    return false;
+  }
+  function squareCoordinates(square) {
+    return [square.charCodeAt(0) - 97, Number(square[1]) - 1];
+  }
+  function arrowLine(move, kind, width, shortening) { if (!/^[a-h][1-8][a-h][1-8]/.test(move || '')) return ''; const a = squarePoint(move.slice(0,2)), b = squarePoint(move.slice(2,4)), dx = b[0] - a[0], dy = b[1] - a[1], length = Math.hypot(dx, dy) || 1, amount = Math.min(shortening || 10, length / 2), x2 = b[0] - dx / length * amount, y2 = b[1] - dy / length * amount; return '<line class="analysis-arrow ' + kind + '" stroke-width="' + width + '" x1="' + a[0] + '" y1="' + a[1] + '" x2="' + x2 + '" y2="' + y2 + '" marker-end="url(#arrow-' + kind + ')"/>'; }
+  function renderArrows(lines) {
+    displayedRoots = [];
+    displayedFen = chess.fen();
+    const useFish = !(settings.enabled && lines.length);
+    if(useFish) lines = (fish.server && fish.pcLines.length) ? fish.pcLines : fish.phoneLines;
+    const defs = arrows.querySelector('defs').outerHTML;
+    if (!settings.showArrows || !lines.length) { arrows.innerHTML = defs; return; }
+    const best = lines[0], bestMove = best && best.pv && best.pv[0];
+    if (!/^[a-h][1-8][a-h][1-8]/.test(bestMove || '')) { arrows.innerHTML = defs; return; }
+    const moveStats = Array.isArray((engine.stats || {}).move_stats) ? engine.stats.move_stats : [];
+    const statsByMove = new Map(moveStats.map(stat => [stat.uci, stat]));
+    // Same priority and total cap as the web: the best piece's maneuver first,
+    // then the existing visit/evaluation-weighted alternative root moves.
+    const shapes = (settings.arrowMode === 'maneuver'
+      ? maneuverArrowShapes(best.pv, 'paleBlue').map(shape => ({move:shape.orig + shape.dest, kind:'blue', width:15}))
+      : [{move:bestMove, kind:'blue', width:15}]).slice(0, settings.arrowCount);
+    const seen = new Set([bestMove.slice(0,4)]);
+    displayedRoots.push(bestMove);
+    const alternatives = useFish ? lines.slice(1) : rankedLeelaAlternativeLines(lines.slice(1), statsByMove);
+    for (const [index, line] of alternatives.entries()) {
+      if (shapes.length >= settings.arrowCount) break;
+      const move = line && line.pv && line.pv[0];
+      if (!move || seen.has(move.slice(0,4))) continue;
+      const shift = useFish ? (lineWinningChance(best)-lineWinningChance(line))/2 : 0;
+      const width = useFish ? (shift<0 || shift>=0.2 ? null : Math.round(12-shift*50)) : alternativeArrowWidth(best, line, index, moveStats, statsByMove);
+      if (width === null) continue;
+      if (/^[a-h][1-8][a-h][1-8]/.test(move)) { seen.add(move.slice(0,4)); displayedRoots.push(move); shapes.push({move, kind:'grey', width}); }
+    }
+    const destinationCounts = new Map();
+    shapes.forEach(shape => destinationCounts.set(shape.move.slice(2,4), (destinationCounts.get(shape.move.slice(2,4)) || 0) + 1));
+    arrows.innerHTML = defs + shapes.map(shape => arrowLine(shape.move, shape.kind, shape.width, destinationCounts.get(shape.move.slice(2,4)) > 1 ? 20 : 10)).join('');
+  }
+  function openPanelView(kind) { if (wrap.classList.contains('expanded')) { wrap.classList.remove('expanded'); refreshBoardBounds(); scheduleStudySave(); } panelView = kind; if (kind === 'repertoireSettings' && repertoirePanel) repertoirePanel.beginSettings(); renderPanel(); }
+  function deleteCurrentBranch() { if (!cursor.parent) return; const parent = cursor.parent; parent.children = parent.children.filter(child => child !== cursor); forgetBranch(cursor);changedBranch(parent);parent.selectedChild = mainlineChild(parent); restore(parent); }
+  function promoteVariation() { const target = variationTarget, parent = target && target.parent; if (!parent) return closePanelView(); const index = parent.children.indexOf(target); if (index > 0) { parent.children.splice(index, 1); parent.children.unshift(target); changedBranch(parent); } parent.selectedChild = target; variationTarget = null; panelView = null; saveStudyNow(); renderPanel(); }
+  function deleteVariation() { const target = variationTarget, parent = target && target.parent; if (!parent) return closePanelView(); const containsCursor = (() => { for (let node = cursor; node; node = node.parent) if (node === target) return true; return false; })(); parent.children = parent.children.filter(child => child !== target); forgetBranch(target);changedBranch(parent);parent.selectedChild = mainlineChild(parent); variationTarget = null; panelView = null; if (containsCursor) restore(parent); else { saveStudyNow(); renderPanel(); } }
+  function resetStudy() { if(!saveStudyNow())return; const editedPosition = !!studyContext.editedPosition; stopGameLoad(); if(repertoirePanel)repertoirePanel.setActive(analysisActive,false); restoring = true; resetTransport(); resetRoot(START_FEN, { gameId:null, editedPosition, initialFen:START_FEN, title:editedPosition?'Edited position':'Local analysis', subtitle:'Starting position' }); wrap.classList.remove('orientation-black'); wrap.classList.add('orientation-white'); if (ground.state.orientation === 'black') ground.toggleOrientation(); sync(null); restoring = false; saveStudyNow(); onPositionChanged(); }
+  function showMenu() { openPanelView('study'); }
+
+  function returnToSavedBoard() {
+    if(!saveStudyNow())return;
+    resetTransport(); panelView = null;
+    let saved=null;try { saved=JSON.parse(native()?.getSourceStudyState?.() || '{}'); } catch(_) {}
+    if(saved && Object.keys(saved).length && (saved.editedPosition || !applyStudyState(saved))) { loadFailed=true;saveNotice('Saved board could not be opened · untouched · tap to retry'); }
+    else if(!saved || !Object.keys(saved).length) { studyContext.editedPosition=false;resetStudy(); }
+    else { saveStudyNow();onPositionChanged(); }
+  }
+  function openBoardEditor(useCurrent = false) {
+    clearClickChoice();
+    if(editingPosition())return;
+    if(!saveStudyNow())return;
+    stopGameLoad();stopActiveNavigation();resetTransport();panelView=null;
+    if(promotionPicker)promotionPicker.querySelector('[data-cancel]').click();
+    if(repertoirePanel)repertoirePanel.setActive(false);
+    if(!positionEditor)positionEditor=window.createPositionEditor({
+      getDraft:()=>native()?.getEditorDraft?.(), saveDraft:raw=>native()?.saveEditorDraft?.(raw),
+      paste:()=>native()?.pastePositionFen?.(), copy:fen=>native()?.copyPositionFen?.(fen),
+      close:(fen,black)=>{
+        document.getElementById('app').hidden=false;
+        if(fen) {
+          restoring=true;resetRoot(fen,{gameId:null,editedPosition:true,initialFen:fen,title:'Edited position',subtitle:'Custom setup'});
+          wrap.classList.toggle('orientation-black',black);wrap.classList.toggle('orientation-white',!black);
+          if(black !== (ground.state.orientation==='black'))ground.toggleOrientation();
+          tab='engine';document.querySelectorAll('.tabs [data-tab]').forEach(b=>b.classList.toggle('selected',b.dataset.tab===tab));
+          sync(null);restoring=false;saveStudyNow();
+        }
+        if(repertoirePanel)repertoirePanel.setActive(analysisActive,false);
+        refreshBoardBounds();onPositionChanged();
+      }
+    });
+    document.getElementById('app').hidden=true;
+    positionEditor.open(chess.fen({forceEnpassantSquare:true}),wrap.classList.contains('orientation-black'),useCurrent);
+  }
+
+  window.InstinctaZero = window.InstinctaZero || {};
+  window.InstinctaZero.onStockfishDownload = (key,ok) => {
+    fishOptions();
+    fish.pendingPack=null;
+    fish.download=ok?'Download ready.':'Download failed. Tap the network to retry.';
+    if(ok && fish.wanted===key){fish.local=key;native()?.setStockfishOptions?.(key,fish.server);startPhoneFish();}
+    renderPanel();
+  };
+  window.InstinctaZero.openBoardEditor = openBoardEditor;
+  function rememberEngineInput(data) { inputEvidence.remember(chess.fen(),settings.backend,legalMoves(),data); }
+  window.InstinctaZero.onNativeAnalysis = function (id, payloadJson) {
+    if(id!==engine.requestId)return;let payload;
+    try{payload=typeof payloadJson==='string'?JSON.parse(payloadJson):payloadJson;}catch(_){return;}
+    const data=payload.data || payload;
+    if(payload.event==='heartbeat'){watchAnalysis();return;}
+    if(payload.event==='stockfish') {
+      watchAnalysis();
+      fish.pcLines = data.lines || [];
+      if(fish.pcLines.length)rememberFishScore("PC Stockfish",fish.pcLines[0]);
+      if (fish.pcLines.length) engine.received = true;
+      queueAnalysisRender(true);
+      return;
+    }
+    if(payload.event==='engine-error' && data.engine==='stockfish'){fish.pcLines=[];fish.pcError='PC Stockfish unavailable.';engine.received=true;queueAnalysisRender(true);return;}
+    if(payload.event==='engine-error' && data.engine==='lc0' && fish.server){engine.lines=[];engine.error='Leela unavailable.';engine.status='error';queueAnalysisRender(true);return;}
+    if(payload.event==='stream-ended'){recoverAnalysis();return;}
+    if(payload.event==='engine-error' || payload.event==='error' || data.error){
+      if(studyContext.gameId && Number(payload.code || data.code) === 404){recoverAnalysis();engine.error='Waiting for the PC archive to sync this game.';queueAnalysisRender();return;}
+      if(payload.retryable===true || data.retryable===true){recoverAnalysis();return;}
+      stopEngineTransport();engine.error=data.error || payload.message || 'Engine unavailable';engine.status='error';queueAnalysisRender();return;
+    }
+    if(payload.event==='done'){
+      rememberEngineInput(data.final_snapshot);
+      if(data.final_snapshot){const snapshot=coherentAnalysisSnapshot(data.final_snapshot,settings.nodes);if(snapshot && snapshot.lines.length){cursor.analysisCache=snapshot;applyAnalysisSnapshot(snapshot,'done',false);engine.received=true;queueAnalysisRender(true);}}
+      if(data.cancelled || (!engine.received && chess.moves().length)){recoverAnalysis();return;}
+      stopEngineTransport();engine.status='done';queueAnalysisRender();return;
+    }
+    watchAnalysis();
+    rememberEngineInput(data);
+    if(data.lines){const snapshot=coherentAnalysisSnapshot(data,settings.nodes);if(snapshot && snapshot.lines.length){cursor.analysisCache=snapshot;applyAnalysisSnapshot(snapshot,'running',false);engine.received=true;queueAnalysisRender(true);}else if(data.progress){engine.progress=data.progress;queueAnalysisRender();}}
+    else if(data.progress){engine.progress=data.progress;queueAnalysisRender();}
+  };
+  window.InstinctaZero.onNativeExplorer = function (id, payloadJson) {
+    if (id !== book.requestId) return;
+    try {
+      const payload = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
+      if (payload && payload.event === 'error') {
+        book.data = null;
+        book.error = payload.message || 'Opening book unavailable';
+      } else {
+        book.data = payload;
+        book.error = '';
+      }
+    } catch (_) {
+      book.data = null;
+      book.error = 'Opening book unavailable';
+    }
+    book.loading = false;
+    renderActivePanel();
+  };
+  window.InstinctaZero.onNativeConnectionState = function () { window.InstinctaZero.refreshDisplayPrivacy(); if (!analysisActive) return; if (settings.enabled || fish.server || fish.local!=='off') scheduleAnalysis(); if (tab === 'book') requestBook(); };
+  window.InstinctaZero.refreshDisplayPrivacy = function () { if(privacy.refresh()){repertoirePanel?.privacyChanged?.();renderPanel();} };
+  window.InstinctaZero.onAccountChanged = function () { if (studyContext.gameId || gameLoading) resetStudy(); };
+  window.InstinctaZero.loadArchivedGame = function (payloadJson) { let payload; try { payload = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson; } catch (_) { return false; } return installArchivedGame(payload); };
+  window.InstinctaZero.persistStudy = saveStudyNow;
+  window.InstinctaZero.setAnalysisActive = function (active) { clearClickChoice(); const next = !!active; if (next === analysisActive) return; analysisActive = next; if(repertoirePanel)repertoirePanel.setActive(next && !gameLoading && !editingPosition()); if (!analysisActive) { resetTransport(); if (engine.status === 'starting' || engine.status === 'running') engine.status = 'idle'; renderActivePanel(); return; } if(gameLoading || editingPosition())return; restoreCachedAnalysis(); scheduleAnalysis(); if (tab === 'book') requestBook(); };
+  window.InstinctaZero.handleAndroidBack = function () { if(editingPosition()) { positionEditor.close(); return true; } if(gameLoading) { stopGameLoad();if(repertoirePanel)repertoirePanel.setActive(analysisActive,false);onPositionChanged();return true; } if (promotionPicker) { promotionPicker.querySelector('[data-cancel]').click(); return true; } if (panelView) { closePanelView(); return true; } if (tab === 'repertoire' && repertoirePanel && repertoirePanel.back()) return true; return false; };
+
+  function animatePanel() { if (panel.animate && !matchMedia('(prefers-reduced-motion: reduce)').matches) panel.animate([{opacity:.5,transform:'translateY(4px)'},{opacity:1,transform:'translateY(0)'}], {duration:120}); }
+  function setTab(next) { if (gameLoading) { if(['info','moves','engine','chart','book','repertoire'].includes(next))gameLoading.tab = next;return; }  if (repertoirePanel && repertoirePanel.isLibrary() && next !== 'repertoire') repertoirePanel.back(); if (!['info','moves','engine','chart','book','repertoire'].includes(next)) return; if (tab === 'book' && next !== 'book') cancelBookRequest(); const refreshBook = panelView === 'bookSettings' && bookSettingsDirty; panelView = null; variationTarget = null; tab = next; animatePanel(); document.querySelectorAll('.tabs [data-tab]').forEach(item => item.classList.toggle('selected', item.dataset.tab === tab)); renderPanel(); scheduleStudySave(); if (tab === 'repertoire' && repertoirePanel) repertoirePanel.refresh(); if (tab === 'book' || refreshBook) { bookSettingsDirty = false; if (tab === 'book') requestBook(); } }
+  function stopActiveNavigation() { if (activeNavigationStop) activeNavigationStop(); }
+  function bindRepeatingNavigation(button, target) { let delay = null, repeat = null, active = false; const stop = () => { active = false; if (delay !== null) clearTimeout(delay); if (repeat !== null) clearInterval(repeat); delay = repeat = null; if (activeNavigationStop === stop) activeNavigationStop = null; button.blur(); }; const go = () => { const next = target(); if (!next) { stop(); return false; } restore(next); button.blur(); return true; }; button.onpointerdown = event => { if (button.disabled) return; event.preventDefault(); stopActiveNavigation(); activeNavigationStop = stop; active = true; if (button.setPointerCapture) { try { button.setPointerCapture(event.pointerId); } catch (_) {} } if (!go()) return; delay = setTimeout(() => { if (active) repeat = setInterval(go, 60); }, 150); }; button.onpointerup = button.onpointercancel = button.onlostpointercapture = stop; button.onclick = event => event.preventDefault(); }
+  document.querySelectorAll('.tabs [data-tab]').forEach(button => button.onclick = () => setTab(button.dataset.tab));
+  document.querySelector('[data-panel-tab]').onclick = closePanelView;
+  document.addEventListener('keydown', event => { if (event.key !== 'Escape') return; if (promotionPicker) promotionPicker.querySelector('[data-cancel]').click(); else if (panelView) closePanelView(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) { clearClickChoice();stopActiveNavigation(); saveStudyNow(); resetTransport(); } else if (analysisActive && (settings.enabled || fish.server || fish.local!=='off')) scheduleAnalysis(); }); window.addEventListener('blur', stopActiveNavigation); window.addEventListener('pagehide', () => { clearClickChoice();stopActiveNavigation(); saveStudyNow(); resetTransport(); });
+  // The host owns Contents and the back stack. Export only closed, named destinations.
+  window.InstinctaZero.folioOpen = name => {
+    if (['moves','engine','book','repertoire','info','chart'].includes(name)) { setTab(name); return; }
+    if (name === 'editor') { openBoardEditor(true); return; }
+    if (['Board','Stockfish','Leela'].includes(name)) { settingsSection=name;openPanelView('settings');return; }
+    if (name === 'bookSettings') { setTab('book');openPanelView('bookSettings');return; }
+    if (name === 'study') openPanelView('study');
+  };
+  document.querySelectorAll('.actions button').forEach(button => { const action = button.dataset.action; if (action === 'flip') button.onclick = flipBoard; else if (action === 'mainline') button.onclick = returnToMainline; else if (action === 'prev' || action === 'next') bindRepeatingNavigation(button, () => action === 'prev' ? cursor.parent : mainlineChild(cursor)); else button.onclick = () => { const target = action === 'settings' ? (tab === 'book' ? 'bookSettings' : tab === 'repertoire' ? 'repertoireSettings' : 'settings') : 'study'; if (panelView === target) closePanelView(); else openPanelView(target); }; });
+  // An overlay only: never change Chessground's pieces, hit targets, or arrow geometry.
+  const repertoireMarker = document.createElement('div');
+  repertoireMarker.className = 'repertoire-book-marker';
+  repertoireMarker.hidden = true;
+  repertoireMarker.setAttribute('role', 'img');
+  repertoireMarker.innerHTML = window.repertoireBookIcon || '';
+  boardEl.appendChild(repertoireMarker);
+  function showRepertoireMarker(kind, endOfLine) {
+    const square = cursor.move && cursor.move.to;
+    repertoireMarker.hidden = !kind || !square;
+    if (repertoireMarker.hidden) return;
+    const black = ground.state.orientation === 'black';
+    const file = square.charCodeAt(0) - 97, rank = Number(square[1]) - 1;
+    repertoireMarker.style.left = ((black ? 7 - file : file) + 1) * 12.5 + '%';
+    repertoireMarker.style.top = (black ? rank : 7 - rank) * 12.5 + '%';
+    repertoireMarker.classList.toggle('end-of-line', !!endOfLine);
+    repertoireMarker.dataset.square = square;
+    repertoireMarker.setAttribute('aria-label', endOfLine ? 'Repertoire move · end of line' : 'Repertoire move');
+  }
+  let repertoireContextCache=null;
+  function repertoireContext() {
+    const cached=repertoireContextCache;
+    if(cached && cached.node===cursor && cached.root===studyContext.initialFen && cached.game===studyContext.gameId)return cached.value;
+    const normalized = fen => { const parts = fen.split(' '); if (parts[3] !== '-' && !new Chess(fen).moves({verbose:true}).some(m => m.flags.includes('e'))) parts[3] = '-'; return parts; };
+    const nodes = [];for(let n=cursor;n && n.move;n=n.parent)nodes.push(n);nodes.reverse();
+    const entries=nodes.map(n=>({san:n.san,fen:n.repertoireFen || (n.repertoireFen=normalized(n.fen).join(' '))}));
+    const value={gameId:studyContext.gameId,root:normalized(studyContext.initialFen).join(' '),fen:normalized(cursor.fen).slice(0,4).join(' '),history:nodes.map(moveUci),entries};
+    repertoireContextCache={node:cursor,root:studyContext.initialFen,game:studyContext.gameId,value};return value;
+  }
+  repertoirePanel = window.createRepertoirePanel ? window.createRepertoirePanel({
+    isActive:() => analysisActive && !gameLoading && !editingPosition(),
+    key:() => studyContext.gameId,
+    status:heading,
+    root:() => studyContext.initialFen,
+    hasMoves:() => !!cursor.parent,
+    context:repertoireContext,repertoireVisible:()=>tab==='repertoire',
+    render:renderPanel, play:playUci, tab:() => setTab('repertoire'), marker:showRepertoireMarker,
+    settings:() => openPanelView('repertoireSettings'), closeSettings:closePanelView
+  }) : null;
+  window.InstinctaZero.openRepertoires = id => { window.InstinctaZero.setAnalysisActive(true); if(gameLoading) { gameLoading.tab = 'repertoire';gameLoading.repertoireId = id;return; } if(repertoirePanel)repertoirePanel.openLibrary(id); };
+  loadUiSettings(); loadStudyState(); document.querySelectorAll('.tabs [data-tab]').forEach(item => item.classList.toggle('selected', item.dataset.tab === tab)); renderPanel(); refreshBoardBounds();
+}());

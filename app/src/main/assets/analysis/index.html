@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" class="board-assets-loading">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'">
+  <title>Folio</title>
+  <link rel="stylesheet" href="analysis.css">
+  <link rel="stylesheet" href="repertoire.css">
+  <link rel="stylesheet" href="position-editor.css">
+  <link rel="stylesheet" href="folio.css">
+  <link rel="preload" as="image" href="brown.svg">
+  <link rel="preload" as="image" href="pieces/wK.svg"><link rel="preload" as="image" href="pieces/wQ.svg"><link rel="preload" as="image" href="pieces/wR.svg"><link rel="preload" as="image" href="pieces/wB.svg"><link rel="preload" as="image" href="pieces/wN.svg"><link rel="preload" as="image" href="pieces/wP.svg">
+  <link rel="preload" as="image" href="pieces/bK.svg"><link rel="preload" as="image" href="pieces/bQ.svg"><link rel="preload" as="image" href="pieces/bR.svg"><link rel="preload" as="image" href="pieces/bB.svg"><link rel="preload" as="image" href="pieces/bN.svg"><link rel="preload" as="image" href="pieces/bP.svg">
+</head>
+<body>
+  <main id="app" aria-label="Analysis workspace">
+    <header class="top">
+      <button class="folio-index-key" data-open-contents aria-label="Open Contents"><svg viewBox="0 0 32 32" class="folio-mark" aria-hidden="true"><path fill="currentColor" d="M3 4h26v5H9v6h15v5H9v8H3z"/><path fill="#f4eee5" d="M14 24h14v4H14z"/></svg><span>Folio</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+      <div class="game-title"><strong data-study-title>Local analysis</strong><small></small></div>
+    </header>
+    <section id="board-wrap" class="board-wrap cburnett" aria-label="Chess board"><div id="board" class="board" role="application"><svg id="arrows" viewBox="0 0 512 512" aria-hidden="true"><defs><marker id="arrow-blue" markerWidth="4" markerHeight="4" refX="2.05" refY="2" orient="auto"><path d="M0,0 V4 L3,2 Z" fill="#003088"/></marker><marker id="arrow-grey" markerWidth="4" markerHeight="4" refX="2.05" refY="2" orient="auto"><path d="M0,0 V4 L3,2 Z" fill="#4a4a4a"/></marker></defs></svg></div></section>
+    <section class="analysis" aria-label="Position panel">
+      <div class="reading"><h2 id="folio-sheet-name"></h2><div class="tab-title" id="tab-title"><span id="leela-eval"></span><span id="sf-eval" hidden></span></div><button data-panel-tab="settings" hidden>Done</button></div>
+      <nav class="tabs" aria-label="Analysis tabs">
+        <button data-tab="moves">Moves</button><button data-tab="engine" class="selected">Engine</button><button data-tab="book">Book</button><button data-tab="repertoire" aria-label="Repertoires">Lines</button><button data-tab="info">Info</button><button data-tab="chart">Chart</button>
+      </nav>
+      <div id="panel" class="panel"></div>
+    </section>
+    <footer class="actions" aria-label="Board controls">
+      <button data-action="menu" aria-label="Study tools"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h7l2 3h7v11H4z"/></svg><span>Study</span></button>
+      <button data-action="settings" aria-label="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h5m4 0h9M3 17h10m4 0h4M8 4v6m5 4v6"/></svg><span>Adjust</span></button>
+      <button data-action="flip" aria-label="Flip board"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 9a7 7 0 0 1 12-3l2 2m0-5v5h-5M19 15A7 7 0 0 1 7 18l-2-2m0 5v-5h5"/></svg><span>Flip</span></button>
+      <button data-action="mainline" class="return-mainline" aria-label="Return to mainline intersection"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v18M18 5c-5 0-8 3-8 8v4m-3-3 3 3 3-3"/></svg></button>
+      <button data-action="prev" aria-label="Previous move"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg></button>
+      <button data-action="next" aria-label="Next move"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
+    </footer>
+  </main>
+  <section id="folio-contents" aria-label="Contents" hidden>
+    <div class="index-top"><svg viewBox="0 0 32 32" class="folio-mark" aria-hidden="true"><path fill="currentColor" d="M3 4h26v5H9v6h15v5H9v8H3z"/><path fill="#f4eee5" d="M14 24h14v4H14z"/></svg><button data-close-contents aria-label="Close Contents"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <h1 tabindex="-1">Contents</h1>
+    <nav class="index-chapters" aria-label="Contents chapters"><button data-chapter="position">Position</button><button data-chapter="collection">Collection</button><button data-chapter="setup">Setup</button></nav>
+    <div id="index-rows"></div>
+    <button class="index-board" data-close-contents><span>Back to board</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15m-6-6 6 6-6 6"/></svg></button>
+  </section>
+  <script src="legacy-chessground.js"></script><script src="chess-rules.js"></script><script src="display-privacy.js"></script><script src="repertoire.js"></script><script src="position-editor.js"></script><script src="click-chess.js"></script><script src="local-stockfish.js"></script><script src="move-input.js"></script><script src="analysis.js"></script><script src="folio.js"></script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+# Third-party notices
+
+## Folio and optional engines
+
+Folio is a GPL-3.0-or-later derivative of [InstinctaZero Android v0.8.23](https://github.com/Raffa2005/InstinctaZero-Android/tree/b718601).
+Folio's Contents, native route hierarchy, presentation and session score chart are new. The
+baseline's rules, interaction, engine transport and storage credits are retained below.
+
+The optional phone engine is [Stockfish.js v19.0.1](https://github.com/nmrugg/stockfish.js/tree/v19.0.1)
+by the Stockfish developers and Stockfish.js contributors (GPL v3). The APK does not contain
+either NNUE/WASM pack. When requested it retrieves the single-thread Lite or Full release from
+that upstream tag; sizes and SHA-256 values are pinned in StockfishDownloads.kt. The linked
+tag is the corresponding source location. The PC engines are remote services, not APK contents.
+
+
+## Click Chess
+
+Offline origin ranking uses the trained model and dependency-free JavaScript
+runtime from [Raffa2005/click-chess](https://github.com/Raffa2005/click-chess).
+Both are MIT-licensed; the full notice ships in
+`app/src/main/assets/analysis/click-chess-LICENSE.txt`.
+Pinned source/model identities and parity fixtures are documented in
+`web-src/click-chess/PROVENANCE.md`. The app adapter is GPL-3.0-or-later.
+
+## Chesslib and Apache Commons Lang
+
+Native one-ply repertoire re-entry uses Chesslib 1.3.7 by bhlangonijr
+(https://github.com/bhlangonijr/chesslib), with Apache Commons Lang 3.18.0.
+Both use Apache-2.0; the license is shipped in `app/src/main/assets/licenses/Apache-2.0.txt`.
+Only local move generation/notation is used, not engine analysis.
+
+## Legacy Lichess mobile Chessground
+
+`web-src/legacy-chessground/` is a source-preserving snapshot of the
+Chessground implementation from
+[`lichess-org/lichobile`](https://github.com/lichess-org/lichobile), commit
+`063167dda7119386cf36708d004d4565203d449a` (2018-04-09). It is bundled into
+`app/src/main/assets/analysis/legacy-chessground.js` by
+`web/build-legacy-chessground.mjs`.
+
+- Copyright: Lichess contributors and the lichobile contributors
+- License: GPL-3.0-or-later
+- Source, upstream notice, and license: `web-src/legacy-chessground/`
+
+## Cburnett pieces and legacy board
+
+The included Cburnett SVG piece set and brown SVG board are byte-for-byte
+legacy lichobile assets from the same revision. Cburnett artwork is attributed
+to Colin M. L. Burnett and is GPL-2.0-or-later as recorded by the upstream
+`COPYING.md`. The board is retained with the legacy source notice.
+
+## chess.js
+
+The local rules controller uses
+[`chess.js`](https://github.com/jhlywa/chess.js) 1.4.0 by Jeff Hlywa.
+
+- License: BSD-2-Clause
+- Pinned source and integrity: `web/package-lock.json`
+- Build/provenance: `web-src/chess-rules-PROVENANCE.md`
+- Full text: `app/src/main/assets/licenses/Chess.js-BSD-2-Clause.txt`
+
+## AndroidSVG
+
+The native completed-game list renders the bundled Cburnett SVG artwork with
+[`AndroidSVG`](https://github.com/BigBadaboom/androidsvg) 1.4 by Paul LeBeau,
+Cave Rock Software Ltd.
+
+- License: Apache-2.0
+- Full text: `app/src/main/assets/licenses/Apache-2.0.txt`
+
+## Fonts
+
+- Noto Sans and Cousine: Apache-2.0
+- Font Awesome webfont: SIL OFL-1.1
+
+Their complete license texts are shipped in `app/src/main/assets/licenses/`.
+The non-free legacy Lichess icon font (`lichess.ttf` and WOFF/WOFF2 variants)
+is deliberately not included or redistributed.
+
+InstinctaZero Android itself is distributed under GPL-3.0-or-later; the full
+GPL version 3 text is in [`LICENSE`](LICENSE).

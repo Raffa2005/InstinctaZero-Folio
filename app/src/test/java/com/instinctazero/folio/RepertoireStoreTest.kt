@@ -1,0 +1,596 @@
+package com.instinctazero.folio
+
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import java.io.File
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk=[35], manifest=Config.NONE)
+class RepertoireStoreTest {
+    private val context: Context get() = RuntimeEnvironment.getApplication()
+    private val root = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    private lateinit var store: RepertoireStore
+    private lateinit var bytes: ByteArray
+    private val fens = mapOf(
+        "" to "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
+        "e2e4" to "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -",
+        "e2e4 e7e5" to "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
+        "e2e4 e7e5 g1f3" to "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
+        "e2e4 e7e5 g1f3 b8c6" to "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -",
+        "e2e4 e7e5 g1f3 b8c6 f1b5" to "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -",
+        "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6" to "r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq -",
+        "e2e4 c7c5" to "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
+        "e2e4 c7c5 g1f3" to "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
+        "e2e4 c7c5 g1f3 b8c6" to "r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -",
+        "e2e4 f7f6" to "rnbqkbnr/ppppp1pp/5p2/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -",
+        "e2e4 f7f6 d2d4" to "rnbqkbnr/ppppp1pp/5p2/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -",
+        "e2e4 f7f6 g1f3" to "rnbqkbnr/ppppp1pp/5p2/8/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
+        "d2d4" to "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -",
+        "g1f3" to "rnbqkbnr/pppppppp/8/8/8/5N2/PPPPPPPP/RNBQKB1R b KQkq -",
+        "g1f3 g8f6" to "rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq -",
+        "g1f3 c7c5" to "rnbqkbnr/pp1ppppp/8/2p5/8/5N2/PPPPPPPP/RNBQKB1R w KQkq -",
+        "g1f3 c7c5 e2e4" to "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -"
+    )
+    private fun fen(moves: List<String>) = fens.getValue(moves.joinToString(" "))
+    private fun entries(moves: List<String>) = JSONArray(moves.mapIndexed { i,move -> JSONObject().put("san",move).put("fen",fen(moves.take(i+1))) })
+    @Before fun setup() {
+        val fixture = File(context.cacheDir, "fixture.sqlite")
+        SQLiteDatabase.openOrCreateDatabase(fixture, null).use { db ->
+            db.execSQL("CREATE TABLE meta(key TEXT,value TEXT)")
+            db.execSQL("INSERT INTO meta VALUES('schema_version','1')")
+            db.execSQL("CREATE TABLE repertoires(id TEXT,name TEXT,side TEXT,pgn TEXT)")
+            db.execSQL("INSERT INTO repertoires VALUES('white','White test','white','white.pgn'),('black','Black test','black','black.pgn')")
+            db.execSQL("CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER,repertoire_id TEXT,path_id TEXT,uci TEXT,san TEXT,kind TEXT,theory INTEGER,line_alternative INTEGER,reason TEXT,comment TEXT,fen TEXT)")
+            for ((rep, offset) in listOf("white" to 0, "black" to 100)) {
+                fun node(id: Int, parent: Int?, moves: List<String>, kind: String = "repertoire", theory: Int = 1, alt: Int = 0) {
+                    db.execSQL("INSERT INTO nodes VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", arrayOf(id+offset,parent?.plus(offset),rep,RepertoireStore.pathId(root,moves),moves.lastOrNull(),moves.lastOrNull(),kind,theory,alt,"Test reason","Comments stay visible",fen(moves)))
+                }
+                node(1,null,emptyList()); node(2,1,listOf("e2e4")); node(3,2,listOf("e2e4","e7e5"))
+                node(4,3,listOf("e2e4","e7e5","g1f3"),"alternative",1,1)
+                node(5,4,listOf("e2e4","e7e5","g1f3","b8c6"),"repertoire",1,1)
+                node(6,2,listOf("e2e4","f7f6"),"refutation",0)
+                node(7,6,listOf("e2e4","f7f6","d2d4"),"analysis",0)
+                node(8,1,listOf("e2e4"),"model_game",0)
+            }
+        }
+        bytes = fixture.readBytes();fixture.copyTo(File(context.filesDir,"mobile_repertoire.sqlite")); store = RepertoireStore(context)
+        store.install(bytes.inputStream(), RepertoireStore.hash(bytes))
+    }
+    @Test fun warmTheoryAndMarkerCachesAvoidOpeningTheDatabase() {
+        val connections = mutableListOf<SQLiteDatabase>()
+        val counted = RepertoireStore(context) { file ->
+            SQLiteDatabase.openDatabase(file.path,null,SQLiteDatabase.OPEN_READONLY).also(connections::add)
+        }
+        val payload = request(emptyList(),listOf("white","black"))
+        val expected = counted.lookup(payload).toString()
+        assertEquals(1,connections.size)
+        assertFalse(connections.single().isOpen)
+        val markers = counted.markers(payload).toString()
+        assertEquals(2,connections.size)
+        connections.clear()
+        repeat(10) {
+            assertEquals(expected,counted.lookup(payload).toString())
+            assertEquals(markers,counted.markers(payload).toString())
+        }
+        assertTrue("Warm reads must not open SQLite",connections.isEmpty())
+        counted.lookup(request(emptyList(),emptyList()))
+        counted.markers(request(emptyList(),emptyList()))
+        assertTrue(connections.isEmpty())
+    }
+    @Test fun failedAndCancelledLookupsCloseTheirLazyConnection() {
+        val connections = mutableListOf<SQLiteDatabase>()
+        val counted = RepertoireStore(context) { file ->
+            SQLiteDatabase.openDatabase(file.path,null,SQLiteDatabase.OPEN_READONLY).also(connections::add)
+        }
+        assertThrows(IllegalArgumentException::class.java) { counted.lookup(request(emptyList(),listOf("missing"))) }
+        assertEquals(1,connections.size);assertFalse(connections.single().isOpen)
+        connections.clear()
+        val cancelled = android.os.CancellationSignal().also { it.cancel() }
+        assertThrows(android.os.OperationCanceledException::class.java) { counted.lookup(request(emptyList()),cancelled) }
+        assertTrue(connections.isEmpty())
+    }
+    @Test fun upgradingTheIndexInvalidatesWarmFactsWithoutErasingEditsOrComments() {
+        val before = result(emptyList()) // Populate the native cache with the old package.
+        val upgraded = File(context.cacheDir,"upgraded.sqlite")
+        upgraded.writeBytes(bytes)
+        SQLiteDatabase.openDatabase(upgraded.path,null,SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL("ALTER TABLE nodes ADD COLUMN fen_before TEXT")
+            db.execSQL("ALTER TABLE nodes ADD COLUMN srs INTEGER DEFAULT 0")
+            db.execSQL("UPDATE nodes SET fen_before=(SELECT p.fen FROM nodes p WHERE p.id=nodes.parent_id)")
+            db.execSQL("CREATE INDEX nodes_before ON nodes(repertoire_id,fen_before)")
+            db.execSQL("UPDATE nodes SET comment='Complete new source comment' WHERE repertoire_id='white'")
+        }
+        val updated = upgraded.readBytes()
+        store.install(updated.inputStream(),RepertoireStore.hash(updated))
+        val after = result(emptyList())
+        assertNotEquals(before.toString(),after.toString())
+        assertEquals("Complete new source comment",after.getJSONArray("comments").getString(0))
+        assertEquals(before.getJSONArray("moves").length(),after.getJSONArray("moves").length())
+        edit(listOf("e2e4"),"analysis")
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        store.undo(store.undoInfo()!!.getString("token"))
+        assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+        assertEquals("Complete new source comment",result(listOf("e2e4")).getJSONArray("comments").getString(0))
+    }
+    @Test fun phoneCreatedRepertoireAndItsCommentSurvivePcInstallationAndUndo() {
+        val id=store.saveRepertoire(JSONObject().put("name","My opening").put("side","white")).getString("created_id")
+        val line=request(listOf("e2e4"),listOf(id))
+        store.edit(JSONObject(line.toString()).put("id",id).put("kind","add"))
+        store.edit(JSONObject(line.toString()).put("id",id).put("kind","comment").put("comment","My note"))
+        val token=store.undoInfo()!!.getString("token")
+        val before=store.lookup(line).toString()
+        store.install(bytes.inputStream(),RepertoireStore.hash(bytes))
+        store=RepertoireStore(context)
+        assertEquals(before,store.lookup(line).toString())
+        assertEquals(3,store.catalog().getJSONArray("repertoires").length())
+        store.undo(token)
+        val after=store.lookup(line).getJSONArray("results").getJSONObject(0)
+        assertTrue(after.getBoolean("theory"));assertEquals(0,after.getJSONArray("comments").length())
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+    private fun request(moves: List<String>, selected: List<String> = listOf("white")) = JSONObject()
+        .put("root",root).put("fen",fen(moves)).put("entries",entries(moves)).put("history",JSONArray(moves)).put("selected",JSONArray(selected))
+    private fun result(moves: List<String>) = store.lookup(request(moves)).getJSONArray("results").getJSONObject(0)
+    private fun edit(moves: List<String>, kind: String, rep: String = "white") = store.edit(request(moves).put("id",rep).put("kind",kind).put("fen",fen(moves.dropLast(1))))
+    private fun updateSource(change:(SQLiteDatabase)->Unit) {
+        val staged=File(context.cacheDir,"changed-source.sqlite");staged.writeBytes(bytes)
+        SQLiteDatabase.openDatabase(staged.path,null,SQLiteDatabase.OPEN_READWRITE).use(change)
+        val incoming=staged.readBytes();store.install(incoming.inputStream(),RepertoireStore.hash(incoming))
+    }
+    private fun savedEdits()=UnifiedRepertoireDatabase.canonical(store.backupSnapshot().getJSONObject("edits")).toByteArray()
+
+    @Test fun mainRecommendationsArePositionScopedRecoverableAndNeverAllAlternatives() {
+        addLine(listOf("d2d4"))
+        fun recs()=result(emptyList()).getJSONArray("moves").let { a -> (0 until a.length()).associate { a.getJSONObject(it).let { m -> m.getString("uci") to m.getString("recommendation") } } }
+        edit(listOf("d2d4"),"main")
+        assertEquals("main",recs()["d2d4"]);assertEquals("alternative",recs()["e2e4"])
+        edit(listOf("e2e4"),"main")
+        assertEquals("main",recs()["e2e4"]);assertEquals("alternative",recs()["d2d4"])
+        assertThrows(IllegalArgumentException::class.java) { edit(listOf("e2e4"),"alternative") }
+        edit(listOf("e2e4"),"delete")
+        assertEquals("main",recs()["d2d4"]);assertFalse(recs().containsKey("e2e4"))
+        store.undo(store.undoInfo()!!.getString("token"));assertEquals("main",recs()["e2e4"])
+        // Imported/legacy all-alternative labels are ambiguous, not an invented ranking.
+        val backup=store.backupSnapshot();val local=backup.getJSONObject("edits").getJSONObject("white")
+        local.getJSONObject(RepertoirePositionBook.edgeKey(fen(emptyList()),"e2e4")).put("kind","alternative")
+        store.restoreBackup(backup)
+        assertEquals(setOf("unassigned"),recs().values.toSet())
+        edit(listOf("d2d4"),"main");assertEquals("main",recs()["d2d4"])
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+    @Test fun repertoireIntersectionFindsLastPositionEvenThroughADifferentMoveOrder() {
+        addLine(listOf("e2e4","c7c5","g1f3","b8c6"))
+        val route=listOf("g1f3","c7c5","e2e4")
+        // At the transposed position a recorded ...Nc6 is a choice even when absent from notation.
+        val req=request(route).put("history",JSONArray(route+"g8f6"))
+        req.getJSONArray("entries").put(JSONObject().put("san","Nf6").put("fen","rnbqkb1r/pp1ppppp/5n2/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -"))
+        req.put("fen",req.getJSONArray("entries").getJSONObject(3).getString("fen")).put("intersections",true)
+        assertEquals(3,store.lookup(req).getJSONArray("results").getJSONObject(0).getInt("intersection"))
+        edit(listOf("e2e4","c7c5","g1f3","b8c6"),"delete")
+        assertTrue(store.lookup(req).getJSONArray("results").getJSONObject(0).getInt("intersection")<3)
+        store.undo(store.undoInfo()!!.getString("token"))
+        assertEquals(3,store.lookup(req).getJSONArray("results").getJSONObject(0).getInt("intersection"))
+        req.put("selected",JSONArray().put("black"))
+        assertTrue(store.lookup(req).getJSONArray("results").getJSONObject(0).getInt("intersection")<3)
+    }
+    @Test fun backupRestoresAllEditsSettingsAndUndoWithoutTouchingGamesOrPgNs() {
+        val id=store.saveRepertoire(JSONObject().put("name","Private local book").put("side","black")).getString("created_id")
+        addLine(listOf("d2d4"));edit(listOf("d2d4"),"main");edit(listOf("e2e4"),"delete")
+        val longComment="Full commentary. ".repeat(2500)
+        store.edit(request(listOf("d2d4")).put("id","white").put("kind","comment").put("comment",longComment))
+        store.saveSettings(JSONObject().put("_selected",JSONArray().put(id).put("white")).put("_bookMarker",false).toString())
+        val backup=store.backupSnapshot();val token=store.undoInfo()!!.getString("token")
+        val pgn=File(context.filesDir,"original.pgn").apply { writeText("[White \"Private name\"]\n1. e4 *") }
+        val untouched=pgn.readBytes();val raw=store.lookup(request(emptyList())).toString()
+        edit(listOf("e2e4"),"restore_move");store.saveSettings("{}")
+        store.restoreBackup(JSONObject(backup.toString()));store=RepertoireStore(context)
+        assertEquals(raw,store.lookup(request(emptyList())).toString());assertFalse(JSONObject(store.settings()).getBoolean("_bookMarker"))
+        assertEquals(longComment,result(listOf("d2d4")).getJSONArray("comments").getString(0))
+        store.undo(token);assertEquals(0,result(listOf("d2d4")).getJSONArray("comments").length())
+        assertArrayEquals(untouched,pgn.readBytes());assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+        val before=store.backupSnapshot().toString()
+        assertThrows(IllegalArgumentException::class.java) { store.restoreBackup(JSONObject(backup.toString()).put("v",9)) }
+        assertEquals(before,store.backupSnapshot().toString())
+    }
+
+    @Test fun activeAndInformationalOccurrencesCoexistAndTerminalTheoryIsValid() {
+        assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+        val terminal = result(listOf("e2e4","e7e5","g1f3","b8c6"))
+        assertTrue(terminal.getBoolean("theory")); assertEquals(0,terminal.getJSONArray("moves").length())
+        assertTrue(terminal.getBoolean("alternative")); assertEquals("repertoire",terminal.getString("kind"))
+    }
+    @Test fun purelyInformationalAndUnknownPositionsRemainOutsideTheBook() {
+        val excluded = result(listOf("e2e4","f7f6","d2d4"))
+        assertFalse(excluded.getBoolean("theory")); assertEquals(2,excluded.getInt("deviation"))
+        val unknown = result(listOf("d2d4"))
+        assertFalse(unknown.getBoolean("known")); assertFalse(unknown.getBoolean("theory"))
+        assertEquals(1,unknown.getInt("deviation"))
+    }
+    @Test fun editsAreSeparateAndPersistWithCombinedAccess() {
+        edit(listOf("e2e4"),"analysis")
+        val both = store.lookup(request(listOf("e2e4","e7e5"),listOf("white","black"))).getJSONArray("results")
+        assertFalse(both.getJSONObject(0).getBoolean("theory")); assertTrue(both.getJSONObject(1).getBoolean("theory"))
+        store = RepertoireStore(context)
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        edit(listOf("e2e4"),"reset"); assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+    }
+    @Test fun onlyOwnSideCanIntroduceAlternatives() {
+        assertThrows(IllegalArgumentException::class.java) { edit(listOf("e2e4"),"alternative") }
+        addLine(listOf("d2d4"))
+        edit(listOf("e2e4"),"alternative")
+        assertTrue(result(listOf("e2e4","e7e5")).getBoolean("alternative"))
+        assertEquals("repertoire",result(listOf("e2e4","e7e5")).getString("kind"))
+        assertThrows(IllegalArgumentException::class.java) { edit(listOf("e2e4","e7e5"),"alternative") }
+        store.edit(request(listOf("e2e4","c7c5"),listOf("black")).put("id","black").put("kind","add"))
+        edit(listOf("e2e4","e7e5"),"alternative","black")
+    }
+    @Test fun addingAndRemovingLocalLinesDoesNotChangeSourceOrCrossExcludedBridges() {
+        val moves = listOf("e2e4","c7c5","g1f3")
+        val entries = entries(moves)
+        store.edit(request(moves).put("id","white").put("kind","add").put("entries",entries))
+        assertTrue(result(moves).getBoolean("theory"))
+        edit(moves.take(2),"analysis"); assertFalse(result(moves).getBoolean("theory"))
+        edit(moves.take(2),"reset"); assertFalse(result(moves).getBoolean("theory"))
+        val excluded = listOf("e2e4","f7f6","g1f3")
+        edit(excluded.take(2),"analysis")
+        assertThrows(IllegalArgumentException::class.java) { store.edit(request(excluded).put("id","white").put("kind","add").put("entries",entries)) }
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+    @Test fun failedDownloadsRetainDatabaseAndUpdatesRetainLocalEdits() {
+        edit(listOf("e2e4"),"analysis")
+        assertThrows(IllegalArgumentException::class.java) { store.install("broken".byteInputStream(),RepertoireStore.hash(bytes)) }
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+        store.install(bytes.inputStream(),RepertoireStore.hash(bytes))
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+    }
+    @Test fun onlyFixedRepertoireRoutesAreAllowed() {
+        val origin = BuildConfig.LEELA_GATEWAY_ORIGIN
+        assertTrue(AnalysisWebPolicy.isAllowedNativeGatewayUrl("$origin/api/mobile/v1/repertoires/index"))
+        assertFalse(AnalysisWebPolicy.isAllowedNativeGatewayUrl("$origin/api/mobile/v1/repertoires/index?file=private"))
+        assertFalse(AnalysisWebPolicy.isAllowedNativeGatewayUrl("$origin/api/mobile/v1/repertoires/../../file"))
+    }
+
+    @Test fun expandedCatalogPreservesSelectionEditsAndUndoAndSupportsIndependentNewTargets() {
+        store.saveSettings("{\"analysis\":[\"white\"],\"_bookMarker\":false}")
+        edit(listOf("e2e4"),"analysis")
+        val token = store.undoInfo()!!.getString("token")
+        val fixture = File(context.cacheDir,"fixture.sqlite")
+        SQLiteDatabase.openDatabase(fixture.path,null,SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL("INSERT INTO repertoires VALUES('third','Third','black','third.pgn'),('fourth','Fourth','white','fourth.pgn'),('fifth','Fifth','white','fifth.pgn'),('sixth','Sixth','black','sixth.pgn')")
+            for ((id,rep) in listOf(201 to "third",202 to "fourth",203 to "fifth",204 to "sixth")) {
+                db.execSQL("INSERT INTO nodes SELECT ?,parent_id,?,path_id,uci,san,kind,theory,line_alternative,reason,comment,fen FROM nodes WHERE id=1",arrayOf(id,rep))
+            }
+        }
+        val updated = fixture.readBytes()
+        store.install(updated.inputStream(),RepertoireStore.hash(updated))
+        store = RepertoireStore(context)
+        assertEquals(6,store.catalog().getJSONArray("repertoires").length())
+        assertEquals("{\"analysis\":[\"white\"],\"_bookMarker\":false}",store.settings())
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        assertEquals(token,store.undoInfo()!!.getString("token"))
+        store.undo(token); assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+        for (rep in listOf("fourth","fifth","sixth")) {
+            val moves = listOf("d2d4")
+            store.edit(request(moves).put("id",rep).put("kind","add"))
+            assertTrue(store.lookup(request(moves,listOf(rep))).getJSONArray("results").getJSONObject(0).getBoolean("theory"))
+            store.undo(store.undoInfo()!!.getString("token"))
+            assertFalse(store.lookup(request(moves,listOf(rep))).getJSONArray("results").getJSONObject(0).getBoolean("theory"))
+        }
+        val sixth = store.lookup(request(emptyList(),listOf("sixth"))).getJSONArray("results").getJSONObject(0)
+        assertEquals("black",sixth.getString("side"))
+    }
+
+    @Test fun oversizedStreamIsRejectedWithoutReplacingSavedCorpusOrUndo() {
+        assertEquals(128L * 1024 * 1024,RepertoireStore.MAX_BYTES)
+        edit(listOf("e2e4"),"analysis")
+        val token = store.undoInfo()!!.getString("token")
+        val tooLarge = object : java.io.InputStream() {
+            var remaining = RepertoireStore.MAX_BYTES + 1
+            override fun read(): Int = if (remaining-- > 0) 0 else -1
+            override fun read(buffer: ByteArray,offset: Int,length: Int): Int {
+                if (remaining <= 0) return -1
+                val count = minOf(length.toLong(),remaining).toInt()
+                java.util.Arrays.fill(buffer,offset,offset+count,0.toByte()); remaining -= count
+                return count
+            }
+        }
+        val error = assertThrows(IllegalArgumentException::class.java) { store.install(tooLarge,"0".repeat(64)) }
+        assertTrue(error.message!!.contains("128 MiB"))
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+        assertEquals(token,store.undoInfo()!!.getString("token"))
+        assertFalse(File(context.filesDir,"mobile_repertoire.download").exists())
+    }
+
+    @Test fun variationIntroductionsAreSeparateAndOlderOfflinePackagesRemainReadable() {
+        assertEquals(0,result(listOf("e2e4")).getJSONArray("starting_comments").length())
+        val fixture = File(context.cacheDir,"fixture.sqlite")
+        SQLiteDatabase.openDatabase(fixture.path,null,SQLiteDatabase.OPEN_READWRITE).use { db ->
+            db.execSQL("ALTER TABLE nodes ADD COLUMN starting_comment TEXT DEFAULT ''")
+            db.execSQL("UPDATE nodes SET starting_comment='Before choosing this variation <note>' WHERE id IN (2,8)")
+        }
+        val updated = fixture.readBytes()
+        store.install(updated.inputStream(),RepertoireStore.hash(updated))
+        val current = result(listOf("e2e4"))
+        assertEquals(1,current.getJSONArray("starting_comments").length())
+        assertEquals("Before choosing this variation <note>",current.getJSONArray("starting_comments").getString(0))
+        assertEquals("Comments stay visible",current.getJSONArray("comments").getString(0))
+        assertEquals(current.getJSONArray("starting_comments").toString(),result(emptyList()).getJSONArray("moves").getJSONObject(0).getJSONArray("starting_comments").toString())
+        store = RepertoireStore(context)
+        assertEquals(1,result(listOf("e2e4")).getJSONArray("starting_comments").length())
+        store.install(bytes.inputStream(),RepertoireStore.hash(bytes))
+        assertEquals(0,result(listOf("e2e4")).getJSONArray("starting_comments").length())
+        assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+    }
+    @Test fun slowNetworkDownloadDoesNotBlockOfflineQueries() {
+        val started = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val delayed = object : java.io.ByteArrayInputStream(bytes) {
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                started.countDown(); check(release.await(5,java.util.concurrent.TimeUnit.SECONDS))
+                return super.read(buffer,offset,length)
+            }
+        }
+        val download = worker.submit { store.install(delayed,RepertoireStore.hash(bytes)) }
+        try {
+            assertTrue(started.await(5,java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+        } finally { release.countDown(); download.get(5,java.util.concurrent.TimeUnit.SECONDS); worker.shutdownNow() }
+    }
+
+    @Test fun allDistinctSourceCommentsSurviveForCurrentMoveAndContinuations() {
+        val longComment = "A full annotation with <markup> & variations.\n".repeat(110)
+        updateSource { db ->
+            db.execSQL("UPDATE nodes SET comment=? WHERE id=8", arrayOf(longComment))
+        }
+        val played = result(listOf("e2e4")).getJSONArray("comments")
+        assertEquals(2,played.length()); assertEquals(longComment,played.getString(1))
+        val continuation = result(emptyList()).getJSONArray("moves").getJSONObject(0).getJSONArray("comments")
+        assertEquals(played.toString(),continuation.toString())
+        assertEquals(1,result(listOf("e2e4","e7e5")).getJSONArray("comments").length())
+    }
+
+    @Test fun transpositionMarkersRespectSourceExclusionsAndPositionIdentity() {
+        val target = "rnbqkb1r/pppppppp/5n2/8/8/5N2/PPPPPPPP/RNBQKB1R w KQkq -"
+        updateSource { db ->
+            db.execSQL("UPDATE nodes SET fen=? WHERE id=3",arrayOf(target))
+        }
+        fun match(fen: String = target) = store.lookup(request(listOf("g1f3","g8f6")).put("fen",fen)).getJSONArray("results").getJSONObject(0)
+        assertTrue(match().getBoolean("theory")); assertEquals(0,match().getInt("deviation"))
+        assertFalse(match(target.replace("w KQkq", "b KQkq")).getBoolean("theory"))
+        assertFalse(match(target.replace("KQkq", "KQ")).getBoolean("theory"))
+        assertFalse(match(target.replace("KQkq -", "KQkq e3")).getBoolean("theory"))
+        edit(listOf("e2e4"),"analysis")
+        assertFalse(match().getBoolean("theory"))
+        edit(listOf("e2e4"),"reset")
+        assertTrue(match().getBoolean("theory"))
+        assertEquals(0,store.lookup(request(listOf("g1f3"),emptyList()).put("fen",target)).getJSONArray("results").length())
+    }
+
+    @Test fun localTranspositionsDisappearWhenTheirParentIsRemovedOrExcluded() {
+        val target = "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -"
+        val moves = listOf("e2e4","c7c5","g1f3")
+        fun add() = store.edit(request(moves).put("id","white").put("kind","add"))
+        fun match() = store.lookup(request(listOf("g1f3","c7c5","e2e4")).put("fen",target)).getJSONArray("results").getJSONObject(0).getBoolean("theory")
+        add(); assertTrue(match())
+        edit(moves.take(2),"analysis"); assertFalse(match())
+        edit(moves.take(2),"reset"); assertFalse(match())
+        add(); assertTrue(match())
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    @Test fun endOfLineIncludesInformationalTailsAndExcludesUnknownHistories() {
+        val terminal = listOf("e2e4","e7e5","g1f3","b8c6")
+        updateSource { db ->
+            db.execSQL("INSERT INTO nodes VALUES(9,5,'white',?,'f1b5','Bb5','analysis',0,0,'Information','A tail',?)",arrayOf(RepertoireStore.pathId(root,terminal+"f1b5"),fen(terminal+"f1b5")))
+        }
+        assertTrue(result(terminal).getBoolean("end_of_line"))
+        assertEquals(1,result(terminal).getJSONArray("moves").length())
+        assertTrue(result(terminal.dropLast(1)).getJSONArray("moves").getJSONObject(0).getBoolean("end_of_line"))
+        assertFalse(result(listOf("d2d4")).getBoolean("end_of_line"))
+        edit(terminal.take(3),"analysis")
+        assertTrue(result(terminal.take(2)).getBoolean("end_of_line"))
+        assertFalse(result(terminal.take(3)).getBoolean("end_of_line"))
+    }
+
+    @Test fun quickAddExtendsTerminalCoverageAndPersistsOnlyToChosenRepertoire() {
+        val terminal = listOf("e2e4","e7e5","g1f3","b8c6")
+        val extended = terminal + listOf("f1b5","a7a6")
+        assertTrue(result(terminal).getBoolean("end_of_line"))
+        assertTrue(result(extended).getBoolean("can_add")); assertEquals(2,result(extended).getInt("add_count"))
+        val request = request(extended).put("id","white").put("kind","add")
+            .put("entries",entries(extended))
+        store.edit(request)
+        store = RepertoireStore(context)
+        assertTrue(result(extended).getBoolean("theory")); assertTrue(result(extended).getBoolean("end_of_line"))
+        assertFalse(result(terminal).getBoolean("end_of_line")); assertFalse(result(extended).getBoolean("can_add"))
+        assertThrows(IllegalArgumentException::class.java) { store.edit(request) }
+        assertFalse(store.lookup(request(extended,listOf("black"))).getJSONArray("results").getJSONObject(0).getBoolean("theory"))
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    @Test fun addEligibilityAndWritesRejectLocalExclusionsButAllowSourceInformation() {
+        edit(listOf("e2e4"),"analysis")
+        for (moves in listOf(listOf("e2e4"),listOf("e2e4","c7c5"),listOf("e2e4","f7f6","g1f3"))) {
+            assertFalse(result(moves).getBoolean("can_add"))
+            assertThrows(IllegalArgumentException::class.java) { store.edit(request(moves).put("id","white").put("kind","add")) }
+        }
+        edit(listOf("e2e4"),"reset")
+        assertTrue(result(listOf("e2e4","f7f6")).getBoolean("can_add"))
+        assertTrue(result(listOf("e2e4","c7c5")).getBoolean("can_add"))
+        assertEquals(1,result(listOf("e2e4","c7c5")).getInt("add_count"))
+    }
+
+    @Test fun sourceRefutationAndInformationalContinuationBecomeOrdinaryLocalMovesInOneSave() {
+        val line=listOf("e2e4","f7f6","d2d4")
+        val original=result(line).getJSONArray("comments").toString()
+        assertEquals(1,result(line).getInt("add_count"));addLine(line)
+        store=RepertoireStore(context)
+        assertFalse(result(line.take(2)).getBoolean("theory")) // Original refutation is not relabelled.
+        for(ply in 3..3) {
+            val r=result(line.take(ply));assertTrue(r.getBoolean("theory"));assertEquals("repertoire",r.getString("kind"))
+            assertFalse(r.getBoolean("alternative"));assertFalse(r.getBoolean("can_add"))
+        }
+        assertEquals(original,result(line).getJSONArray("comments").toString())
+        store.undo(undoToken());assertFalse(result(line).getBoolean("theory"));assertEquals(1,result(line).getInt("add_count"))
+        edit(line.take(2),"analysis")
+        assertFalse(result(line).getBoolean("can_add"));assertThrows(IllegalArgumentException::class.java){addLine(line)}
+        edit(line.take(2),"reset");addLine(line);edit(line.take(2),"delete")
+        assertFalse(result(line).getBoolean("can_add"));assertThrows(IllegalArgumentException::class.java){addLine(line)}
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    @Test fun aBoardRootedInsideSourceInformationCanExtendButNotInsideAnExcludedSourcePath() {
+        val line=listOf("e2e4","f7f6","d2d4")
+        val request=request(line).put("root",fen(line.take(2))).put("history",JSONArray().put("d2d4"))
+            .put("entries",JSONArray().put(entries(line).getJSONObject(2))).put("id","white").put("kind","add")
+        assertTrue(store.lookup(request).getJSONArray("results").getJSONObject(0).getBoolean("can_add"))
+        store.edit(request);store=RepertoireStore(context);assertTrue(result(line).getBoolean("theory"))
+        store.undo(undoToken());edit(line.take(2),"analysis")
+        assertFalse(store.lookup(request).getJSONArray("results").getJSONObject(0).getBoolean("can_add"))
+        assertThrows(IllegalArgumentException::class.java){store.edit(request)}
+    }
+
+    @Test fun failedMultiMoveAdditionRollsBackAllNewMoves() {
+        val moves = listOf("e2e4","c7c5","g1f3")
+        val entries = JSONArray().put(JSONObject().put("san","e4").put("fen",fen(moves.take(1))))
+            .put(JSONObject().put("san","c5").put("fen",fen(moves.take(2)))).put(JSONObject())
+        assertThrows(org.json.JSONException::class.java) { store.edit(request(moves).put("id","white").put("kind","add").put("entries",entries)) }
+        assertFalse(result(moves.take(2)).getBoolean("theory"))
+        assertEquals(2,result(moves).getInt("add_count"))
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    private fun addLine(moves: List<String>, rep: String = "white") = store.edit(request(moves).put("id",rep).put("kind","add")
+        .put("entries",entries(moves)))
+    private fun editsWithoutUndo(): Map<String, Map<String, String>> {
+        val saved = store.backupSnapshot().getJSONObject("edits").also { it.remove("_undo");it.remove("_settings") }
+        return saved.keys().asSequence().associateWith { rep ->
+            val paths = saved.getJSONObject(rep)
+            paths.keys().asSequence().associateWith { UnifiedRepertoireDatabase.canonical(paths.getJSONObject(it)) }
+        }
+    }
+    private fun undoToken() = store.undoInfo()!!.getString("token")
+
+    @Test fun undoAddedLineSurvivesRestartAndCorpusUpdateAndPreservesExistingPrefixes() {
+        addLine(listOf("d2d4"))
+        addLine(listOf("e2e4","c7c5"))
+        edit(listOf("e2e4"),"alternative")
+        edit(listOf("e2e4"),"analysis","black")
+        store.saveSettings("{\"analysis\":[\"white\",\"black\"],\"_bookMarker\":true}")
+        val settings = store.settings(); val before = editsWithoutUndo()
+        val line = listOf("e2e4","c7c5","g1f3","b8c6")
+        addLine(line)
+        assertEquals("Added 2 moves",store.undoInfo()!!.getString("label"))
+        val token = undoToken()
+        store = RepertoireStore(context)
+        store.install(bytes.inputStream(),RepertoireStore.hash(bytes))
+        assertEquals(token,store.catalog().getJSONObject("undo").getString("token"))
+        store.undo(token)
+        assertTrue(result(line.take(2)).getBoolean("theory")); assertTrue(result(line.take(2)).getBoolean("alternative"))
+        assertFalse(result(line).getBoolean("theory")); assertEquals(2,result(line).getInt("add_count"))
+        assertEquals(before,editsWithoutUndo()); assertEquals(settings,store.settings())
+        assertNull(store.undoInfo())
+        store = RepertoireStore(context); assertNull(store.undoInfo())
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    @Test fun undoExclusionRestoresTheExactPriorAlternativeLabel() {
+        addLine(listOf("d2d4"))
+        edit(listOf("e2e4"),"alternative")
+        val before = editsWithoutUndo()
+        edit(listOf("e2e4"),"analysis")
+        assertFalse(result(listOf("e2e4","e7e5")).getBoolean("theory"))
+        store.undo(undoToken())
+        assertTrue(result(listOf("e2e4","e7e5")).getBoolean("theory"))
+        assertTrue(result(listOf("e2e4","e7e5")).getBoolean("alternative"))
+        assertEquals(before,editsWithoutUndo())
+    }
+
+    @Test fun undoRemovalRestoresLocalAdditionAndItsDescendants() {
+        val moves = listOf("e2e4","c7c5","g1f3")
+        addLine(moves); val before = editsWithoutUndo()
+        edit(moves.take(2),"reset")
+        assertEquals("Removed local addition",store.undoInfo()!!.getString("label"))
+        assertFalse(result(moves).getBoolean("theory"))
+        store.undo(undoToken())
+        assertEquals(before,editsWithoutUndo()); assertTrue(result(moves).getBoolean("theory"))
+        assertTrue(result(moves).getBoolean("end_of_line"))
+    }
+
+    @Test fun undoOptionalAndRestoredLabelsDoesNotTouchSourceData() {
+        assertNull(store.undoInfo())
+        assertThrows(IllegalStateException::class.java) { store.undo("none") }
+        addLine(listOf("d2d4"))
+        edit(listOf("e2e4"),"alternative"); store.undo(undoToken())
+        assertFalse(result(listOf("e2e4")).getBoolean("alternative"))
+        edit(listOf("e2e4"),"analysis"); edit(listOf("e2e4"),"reset")
+        assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+        store.undo(undoToken()); assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        assertArrayEquals(bytes,File(context.filesDir,"mobile_repertoire.sqlite").readBytes())
+    }
+
+    @Test fun failedAndNoOpEditsKeepTheLastMeaningfulUndo() {
+        edit(listOf("e2e4"),"analysis"); val token = undoToken()
+        val before = savedEdits()
+        edit(listOf("e2e4"),"analysis")
+        edit(listOf("e2e4","e7e5"),"reset")
+        assertThrows(IllegalArgumentException::class.java) { addLine(listOf("e2e4","c7c5")) }
+        assertEquals(token,undoToken()); assertArrayEquals(before,savedEdits())
+        store.undo(token); assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+    }
+
+    @Test fun staleOrRepeatedUndoCannotUndoADifferentRepertoiresNewerChange() {
+        edit(listOf("e2e4"),"analysis"); val stale = undoToken()
+        edit(listOf("e2e4"),"analysis","black"); val latest = undoToken()
+        val before = editsWithoutUndo()
+        assertThrows(IllegalArgumentException::class.java) { store.undo(stale) }
+        assertEquals(before,editsWithoutUndo()); assertEquals("black",store.undoInfo()!!.getString("repertoire"))
+        store.undo(latest)
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        assertTrue(store.lookup(request(listOf("e2e4"),listOf("black"))).getJSONArray("results").getJSONObject(0).getBoolean("theory"))
+        assertThrows(IllegalStateException::class.java) { store.undo(latest) }
+    }
+
+    @Test fun failedAtomicWritesPreserveBothTheEditsAndTheirUndo() {
+        edit(listOf("e2e4"),"analysis"); val token = undoToken()
+        val before = savedEdits()
+        store=RepertoireStore(context,checkpoint={ phase -> if(phase=="edit_commit")throw java.io.IOException("Injected transaction interruption") })
+        assertThrows(java.io.IOException::class.java) { store.undo(token) }
+        assertThrows(java.io.IOException::class.java) { edit(listOf("e2e4"),"analysis","black") }
+        assertEquals(token,undoToken()); assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        assertArrayEquals(before,savedEdits())
+        store = RepertoireStore(context); store.undo(token)
+        assertTrue(result(listOf("e2e4")).getBoolean("theory"))
+    }
+
+    @Test fun oldEditsAndInvalidJournalsRemainUsableWithoutInventingAnUndo() {
+        edit(listOf("e2e4"),"analysis")
+        val original = store.backupSnapshot().getJSONObject("edits").toString()
+        fun migrate(value:JSONObject) {
+            val directory=java.nio.file.Files.createTempDirectory(context.cacheDir.toPath(),"legacy-journal-").toFile()
+            File(directory,"mobile_repertoire.sqlite").writeBytes(bytes)
+            File(directory,"mobile_repertoire_edits.json").writeText(value.toString())
+            store=RepertoireStore(object:android.content.ContextWrapper(context) {override fun getFilesDir()=directory})
+        }
+        val corrupt = JSONObject(original); corrupt.getJSONObject("_undo").remove("changes");migrate(corrupt)
+        assertNull(store.undoInfo()); assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        val stale = JSONObject(original)
+        stale.put("black",JSONObject().put(RepertoireStore.pathId(root,listOf("e2e4")),JSONObject().put("kind","analysis")))
+        migrate(stale)
+        assertNull(store.undoInfo()); assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+        stale.remove("_undo");migrate(stale)
+        assertNull(store.undoInfo())
+        edit(listOf("e2e4"),"reset"); store.undo(undoToken())
+        assertFalse(result(listOf("e2e4")).getBoolean("theory"))
+    }
+}
